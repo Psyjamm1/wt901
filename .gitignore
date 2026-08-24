@@ -1,0 +1,30 @@
+# Sensor data — NEVER commit this. A single shift is ~80 MB of raw data
+# and several hundred MB once decoded to JSON Lines. GitHub rejects files
+# over 100 MB outright, and a repo full of measurements is unusable.
+*.jsonl
+*.TXT
+*.txt
+!requirements.txt
+data/
+sessions/
+collected.json
+collector.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.fseventsd
+
+# Editors
+.vscode/
+.idea/
+*.swp

@@ -321,6 +321,22 @@ def convert_all(paths, out_dir):
         rate = (len(session) - 1) / span if span > 0 else 0
         log(f"  {target.name}  {len(session)} samples, "
             f"{span / 60:.1f} min, ~{rate:.0f} Hz")
+
+        # Small sidecar so --status never has to re-read a huge .jsonl
+        try:
+            meta = target.with_suffix(".meta.json")
+            meta.write_text(json.dumps({
+                "file": target.name,
+                "samples": len(session),
+                "seconds": round(span, 1),
+                "rate_hz": round(rate, 1),
+                "start": session[0]["t"],
+                "end": session[-1]["t"],
+                "bytes": target.stat().st_size,
+            }, indent=1))
+        except OSError:
+            pass
+
         written += len(session)
         files += 1
 
@@ -435,6 +451,54 @@ def digest(path, chunk=1024 * 1024):
 
 
 # --------------------------------------------------------------------------
+# Single-instance lock
+# --------------------------------------------------------------------------
+
+def lock_path():
+    return OUT_DIR / "collector.lock"
+
+
+class Busy(Exception):
+    """Another instance is already working on this volume."""
+
+
+def acquire_lock(stale_after=900):
+    """Take an exclusive lock, or raise Busy.
+
+    The monitor and the launchd agent both react to a mount, so without
+    this they race for the same files: whoever loses copies nothing and
+    the card may end up not cleared. A stale lock left by a crashed run
+    is ignored after stale_after seconds.
+    """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = lock_path()
+
+    if path.exists():
+        try:
+            age = time.time() - path.stat().st_mtime
+            if age < stale_after:
+                raise Busy(path.read_text().strip() or "another instance")
+            path.unlink()
+        except OSError:
+            pass
+
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise Busy("another instance")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(f"pid {os.getpid()}\n")
+    return path
+
+
+def release_lock():
+    try:
+        lock_path().unlink()
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
 # Main workflow
 # --------------------------------------------------------------------------
 
@@ -483,6 +547,19 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
     if not is_sensor(volume):
         return False
 
+    try:
+        acquire_lock()
+    except Busy as who:
+        log(f"volume {volume.name}: skipped, {who} is already collecting")
+        return False
+
+    try:
+        return _collect(volume, delete_after, progress, done_bytes)
+    finally:
+        release_lock()
+
+
+def _collect(volume, delete_after, progress=None, done_bytes=None):
     seen = load_state()
     everything = data_files(volume)
     if not everything:
@@ -1189,6 +1266,150 @@ async def ble_main(mode):
     return 0
 
 
+
+# --------------------------------------------------------------------------
+# Status overview
+# --------------------------------------------------------------------------
+
+def device_summary():
+    """One record per known sensor, built from the sidecar metadata.
+
+    Reading .meta.json instead of the .jsonl keeps this instant even when
+    a device holds gigabytes of recordings.
+    """
+    docked = {}
+    for volume in find_volumes():
+        if is_sensor(volume):
+            docked[safe_name(volume.name)] = volume
+
+    devices = []
+    if OUT_DIR.is_dir():
+        known = [p for p in OUT_DIR.iterdir()
+                 if p.is_dir() and (p / "sessions").is_dir()]
+    else:
+        known = []
+
+    for name in sorted({p.name for p in known} | set(docked)):
+        sessions_dir = OUT_DIR / name / "sessions"
+        sessions, samples, size, last, first = 0, 0, 0, None, None
+
+        if sessions_dir.is_dir():
+            for meta_file in sessions_dir.rglob("*.meta.json"):
+                try:
+                    meta = json.loads(meta_file.read_text())
+                except (OSError, ValueError):
+                    continue
+                sessions += 1
+                samples += meta.get("samples", 0)
+                size += meta.get("bytes", 0)
+                for key, keep in (("end", "last"), ("start", "first")):
+                    value = meta.get(key)
+                    if not value:
+                        continue
+                    if keep == "last" and (last is None or value > last):
+                        last = value
+                    if keep == "first" and (first is None or value < first):
+                        first = value
+
+            # Fall back to file times for sessions collected before metadata
+            if not sessions:
+                found = list(sessions_dir.rglob("*.jsonl"))
+                sessions = len(found)
+                size = sum(f.stat().st_size for f in found)
+
+        devices.append({
+            "device": name,
+            "docked": name in docked,
+            "volume": str(docked[name]) if name in docked else None,
+            "sessions": sessions,
+            "samples": samples,
+            "bytes": size,
+            "first": first,
+            "last": last,
+        })
+    return devices
+
+
+def collector_state():
+    """Is a collection running right now, and how long has it been going?"""
+    path = lock_path()
+    if not path.exists():
+        return None
+    try:
+        age = time.time() - path.stat().st_mtime
+        return {"holder": path.read_text().strip(), "age_s": round(age)}
+    except OSError:
+        return None
+
+
+def free_space():
+    try:
+        usage = shutil.disk_usage(OUT_DIR if OUT_DIR.is_dir() else Path.home())
+        return {"free": usage.free, "total": usage.total}
+    except OSError:
+        return None
+
+
+def ago(iso):
+    if not iso:
+        return "never"
+    try:
+        delta = (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
+    except ValueError:
+        return "?"
+    if delta < 0:
+        return "in the future"
+    for limit, div, unit in ((90, 1, "s"), (5400, 60, "min"),
+                             (172800, 3600, "h")):
+        if delta < limit:
+            return f"{delta / div:.0f} {unit} ago"
+    return f"{delta / 86400:.1f} days ago"
+
+
+def show_status(as_json=False):
+    devices = device_summary()
+    running = collector_state()
+    space = free_space()
+
+    if as_json:
+        print(json.dumps({
+            "generated": datetime.now().isoformat(timespec="seconds"),
+            "devices": devices,
+            "collecting": running,
+            "disk": space,
+        }, indent=1))
+        return
+
+    print()
+    print(f"  {'DEVICE':<12} {'DOCKED':<8} {'SESSIONS':>9} {'SAMPLES':>12} "
+          f"{'SIZE':>9}  LAST RECORDING")
+    print("  " + "-" * 72)
+
+    if not devices:
+        print("  no devices seen yet\n")
+    for d in devices:
+        mark = "yes" if d["docked"] else "-"
+        print(f"  {d['device']:<12} {mark:<8} {d['sessions']:>9} "
+              f"{d['samples']:>12,} {human(d['bytes']):>9}  {ago(d['last'])}")
+
+    print()
+    if running:
+        print(f"  collecting now: {running['holder']} "
+              f"({running['age_s']} s)")
+    else:
+        print("  idle")
+
+    if space:
+        used = 100 * (1 - space["free"] / space["total"])
+        print(f"  disk: {human(space['free'])} free, {used:.0f}% used")
+
+    total_bytes = sum(d["bytes"] for d in devices)
+    if space and total_bytes:
+        days = space["free"] / (total_bytes / max(1, len(devices)) or 1)
+        print(f"  data collected so far: {human(total_bytes)}")
+    print()
+
+
 # --------------------------------------------------------------------------
 # Auto-run on device connect
 # --------------------------------------------------------------------------
@@ -1305,6 +1526,10 @@ def main():
                         help="remove the auto-run agent")
     parser.add_argument("--volume", metavar="NAME",
                         help="only use volumes whose name contains this")
+    parser.add_argument("--status", action="store_true",
+                        help="overview of all sensors and collected data")
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable output for --status")
     parser.add_argument("--keep-raw", action="store_true",
                         help="keep the raw .TXT files after decoding")
 
@@ -1345,6 +1570,8 @@ def main():
                     else "verify" if args.verify
                     else "listen" if args.listen else "apply")
             sys.exit(asyncio.run(ble_main(mode)))
+        elif args.status:
+            show_status(args.json)
         elif args.list:
             list_volumes()
         elif args.install:

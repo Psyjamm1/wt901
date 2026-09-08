@@ -418,13 +418,32 @@ def is_sensor(volume):
         return False
 
 
+# Directories that hold OS bookkeeping, never sensor data. On macOS these
+# are hidden by a leading dot, but Linux shows their contents plainly, so
+# filtering on the file name alone is not enough.
+JUNK_DIRS = {
+    ".spotlight-v100", ".fseventsd", ".trashes", ".temporaryitems",
+    ".documentrevisions-v100", "system volume information",
+    "$recycle.bin", "found.000", ".ds_store",
+}
+
+
+def in_junk_dir(path, volume):
+    """True if any folder between the volume root and the file is OS junk."""
+    try:
+        parts = path.relative_to(volume).parts[:-1]
+    except ValueError:
+        return False
+    return any(p.lower() in JUNK_DIRS or p.startswith(".") for p in parts)
+
+
 def data_files(volume):
     files = []
     try:
         for path in volume.rglob("*"):
             if path.name.startswith(".") or not path.is_file():
                 continue
-            if path.is_symlink():
+            if path.is_symlink() or in_junk_dir(path, volume):
                 continue
             if DATA_SUFFIXES and path.suffix.lower() not in DATA_SUFFIXES:
                 continue

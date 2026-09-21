@@ -81,6 +81,16 @@ PROTECTED_NAMES = {"SET.TXT", "SETTING.TXT", "CONFIG.TXT"}
 # unlabelled stick, so we match on the presence of recording files.
 REQUIRED_GLOB = "WIT*.TXT"
 
+# --- Cameras (DJI Osmo Action 5 Pro) ---
+# Recordings land in DCIM/DJI_NNN/DJI_<timestamp>_<seq>_D.MP4, each with a
+# low-res .LRF proxy beside it. The proxy is redundant with the MP4, so it
+# is skipped unless CAMERA_KEEP_LRF is set.
+CAMERA_VIDEO_EXTS = {".MP4", ".MOV"}
+CAMERA_KEEP_LRF = False
+# The camera's built-in storage mounts with the same label on every unit,
+# so it cannot identify a camera. Record to the microSD card instead.
+CAMERA_SKIP_LABELS = {"OSMOACTION"}
+
 # OS volumes that can never be a sensor
 IGNORED_NAMES = {
     "Macintosh HD", "Preboot", "Recovery", "VM", "Update", "Data",
@@ -406,16 +416,30 @@ def find_volumes():
     return found
 
 
-def is_sensor(volume):
-    """A volume counts as a sensor if it holds recording files."""
-    if not REQUIRED_GLOB:
-        return True
+def device_kind(volume):
+    """Return "bracelet", "camera" or None for a mounted volume."""
     try:
-        return any(volume.glob(REQUIRED_GLOB)) or any(
-            volume.glob(REQUIRED_GLOB.lower())
-        )
+        if REQUIRED_GLOB and (any(volume.glob(REQUIRED_GLOB))
+                              or any(volume.glob(REQUIRED_GLOB.lower()))):
+            return "bracelet"
     except OSError:
-        return False
+        return None
+
+    if volume.name.upper() in CAMERA_SKIP_LABELS:
+        return None
+    dcim = volume / "DCIM"
+    try:
+        if dcim.is_dir() and any(p.is_dir() and p.name.upper().startswith("DJI")
+                                 for p in dcim.iterdir()):
+            return "camera"
+    except OSError:
+        pass
+    return None
+
+
+def is_sensor(volume):
+    """Any volume we know how to collect from."""
+    return device_kind(volume) is not None
 
 
 # Directories that hold OS bookkeeping, never sensor data. On macOS these
@@ -561,6 +585,129 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
     return copied_bytes
 
 
+
+def camera_files(volume):
+    """Video files in DCIM, oldest first. Proxies only when requested."""
+    wanted = set(CAMERA_VIDEO_EXTS)
+    if CAMERA_KEEP_LRF:
+        wanted.add(".LRF")
+    found = []
+    dcim = volume / "DCIM"
+    try:
+        for path in dcim.rglob("*"):
+            if path.name.startswith(".") or not path.is_file():
+                continue
+            if path.suffix.upper() in wanted:
+                found.append(path)
+    except OSError as exc:
+        log(f"  volume unreadable: {exc}")
+    return sorted(found, key=lambda p: p.name)
+
+
+def video_stamp(path):
+    """DJI_20260920191737_0001_D.MP4 -> 2026-09-20T19:17:37, or None."""
+    parts = path.stem.split("_")
+    if len(parts) >= 2 and len(parts[1]) == 14 and parts[1].isdigit():
+        try:
+            return datetime.strptime(parts[1], "%Y%m%d%H%M%S").isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
+    seen = load_state()
+    everything = camera_files(volume)
+    fresh = [f for f in everything if file_key(f, volume.name) not in seen]
+
+    if not fresh:
+        log(f"camera {volume.name}: nothing new ({len(everything)} already collected)")
+        return False
+
+    total = sum(f.stat().st_size for f in fresh)
+    log(f"camera {volume.name}: {len(fresh)} new videos, {human(total)}")
+
+    device_dir = OUT_DIR / safe_name(volume.name)
+    session = device_dir / "sessions" / datetime.now().strftime("%Y%m%d_%H%M%S")
+    session.mkdir(parents=True, exist_ok=True)
+
+    copied, failed = [], []
+    for source in fresh:
+        target = session / source.name
+        ok, size_bytes = False, 0
+        for attempt in range(1, COPY_ATTEMPTS + 1):
+            try:
+                hook = None
+                if progress:
+                    hook = lambda got, tot, n=source.name: progress(got, tot, n)
+                size_bytes = copy_verified(source, target, on_progress=hook)
+                if done_bytes is not None:
+                    done_bytes[0] += size_bytes
+                ok = True
+                break
+            except OSError as exc:
+                log(f"  {source.name}: attempt {attempt} failed - {exc}")
+                try:
+                    if target.exists():
+                        target.unlink()
+                except OSError:
+                    pass
+                if attempt < COPY_ATTEMPTS:
+                    time.sleep(RETRY_DELAY)
+
+        if not ok:
+            log(f"  {source.name} skipped, original left on the camera")
+            failed.append(source)
+            continue
+
+        seen.add(file_key(source, volume.name))
+        copied.append((source, target))
+        log(f"  {source.name}  {human(size_bytes)}  ok")
+
+        try:
+            target.with_suffix(".meta.json").write_text(json.dumps({
+                "file": target.name,
+                "kind": "video",
+                "bytes": size_bytes,
+                "start": video_stamp(source),
+                "end": video_stamp(source),
+                "samples": 0,
+            }, indent=1))
+        except OSError:
+            pass
+
+    save_state(seen)
+
+    if not copied:
+        notify("Camera download failed",
+               f"{len(failed)} videos unreadable. Camera data is intact.")
+        return False
+
+    log(f"saved {len(copied)} videos to {session}")
+
+    if delete_after:
+        removed = 0
+        for source, _ in copied:
+            try:
+                source.unlink()
+                removed += 1
+                # The proxy is useless without its video
+                proxy = source.with_suffix(".LRF")
+                if not CAMERA_KEEP_LRF and proxy.exists():
+                    proxy.unlink()
+            except OSError as exc:
+                log(f"  could not delete {source.name}: {exc}")
+        log(f"  removed {removed} videos from the camera")
+    else:
+        log("  camera not cleared (no --delete)")
+
+    copied_bytes = sum(t.stat().st_size for _, t in copied)
+    notify("Camera footage collected",
+           f"{len(copied)} videos, {human(copied_bytes)}. The camera can be taken.")
+    unmount(volume)
+    return True
+
+
 def collect(volume, delete_after, progress=None, done_bytes=None):
     """Collect new files from a volume. True if anything was copied."""
     if not is_sensor(volume):
@@ -573,6 +720,8 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
         return False
 
     try:
+        if device_kind(volume) == "camera":
+            return _collect_camera(volume, delete_after, progress, done_bytes)
         return _collect(volume, delete_after, progress, done_bytes)
     finally:
         release_lock()
@@ -1296,10 +1445,12 @@ def device_summary():
     Reading .meta.json instead of the .jsonl keeps this instant even when
     a device holds gigabytes of recordings.
     """
-    docked = {}
+    docked, kinds = {}, {}
     for volume in find_volumes():
-        if is_sensor(volume):
+        kind = device_kind(volume)
+        if kind:
             docked[safe_name(volume.name)] = volume
+            kinds[safe_name(volume.name)] = kind
 
     devices = []
     if OUT_DIR.is_dir():
@@ -1311,6 +1462,7 @@ def device_summary():
     for name in sorted({p.name for p in known} | set(docked)):
         sessions_dir = OUT_DIR / name / "sessions"
         sessions, samples, size, last, first = 0, 0, 0, None, None
+        kind = kinds.get(name)
 
         if sessions_dir.is_dir():
             for meta_file in sessions_dir.rglob("*.meta.json"):
@@ -1319,6 +1471,10 @@ def device_summary():
                 except (OSError, ValueError):
                     continue
                 sessions += 1
+                if meta.get("kind") == "video":
+                    kind = kind or "camera"
+                else:
+                    kind = kind or "bracelet"
                 samples += meta.get("samples", 0)
                 size += meta.get("bytes", 0)
                 for key, keep in (("end", "last"), ("start", "first")):
@@ -1338,6 +1494,7 @@ def device_summary():
 
         devices.append({
             "device": name,
+            "kind": kind or "?",
             "docked": name in docked,
             "volume": str(docked[name]) if name in docked else None,
             "sessions": sessions,
@@ -1400,16 +1557,17 @@ def show_status(as_json=False):
         return
 
     print()
-    print(f"  {'DEVICE':<12} {'DOCKED':<8} {'SESSIONS':>9} {'SAMPLES':>12} "
-          f"{'SIZE':>9}  LAST RECORDING")
-    print("  " + "-" * 72)
+    print(f"  {'DEVICE':<12} {'KIND':<9} {'DOCKED':<7} {'FILES':>6} "
+          f"{'SAMPLES':>12} {'SIZE':>10}  LAST RECORDING")
+    print("  " + "-" * 78)
 
     if not devices:
         print("  no devices seen yet\n")
     for d in devices:
         mark = "yes" if d["docked"] else "-"
-        print(f"  {d['device']:<12} {mark:<8} {d['sessions']:>9} "
-              f"{d['samples']:>12,} {human(d['bytes']):>9}  {ago(d['last'])}")
+        samples = f"{d['samples']:,}" if d["kind"] != "camera" else "-"
+        print(f"  {d['device']:<12} {d['kind']:<9} {mark:<7} {d['sessions']:>6} "
+              f"{samples:>12} {human(d['bytes']):>10}  {ago(d['last'])}")
 
     print()
     if running:

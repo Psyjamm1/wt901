@@ -395,7 +395,11 @@ def convert_file(path):
 
 def find_volumes():
     found = []
-    for root in mount_roots():
+    roots = [r for r in mount_roots() if r.is_dir()]
+    # /media contains /media/<user>, which is itself a mount root on Linux,
+    # not a device. Never report a root as a volume.
+    root_set = {r.resolve() for r in roots}
+    for root in roots:
         if not root.is_dir():
             continue
         try:
@@ -408,6 +412,11 @@ def find_volumes():
             if not entry.is_dir():
                 continue
             if entry.is_symlink():
+                continue
+            try:
+                if entry.resolve() in root_set:
+                    continue
+            except OSError:
                 continue
             if VOLUME_FILTER and VOLUME_FILTER.lower() not in entry.name.lower():
                 continue
@@ -695,6 +704,17 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
                 proxy = source.with_suffix(".LRF")
                 if not CAMERA_KEEP_LRF and proxy.exists():
                     proxy.unlink()
+                # Gallery thumbnails in MISC/THM share the video's stem
+                # exactly (DJI_..._0001_D.THM / .SCR), so matching on the
+                # full stem cannot touch another recording's files.
+                thumbs = volume / "MISC" / "THM"
+                if thumbs.is_dir():
+                    for leftover in thumbs.rglob(source.stem + ".*"):
+                        if leftover.suffix.upper() in (".THM", ".SCR"):
+                            try:
+                                leftover.unlink()
+                            except OSError:
+                                pass
             except OSError as exc:
                 log(f"  could not delete {source.name}: {exc}")
         log(f"  removed {removed} videos from the camera")
@@ -1019,10 +1039,17 @@ def list_volumes():
     seen = load_state()
     print()
     for volume in volumes:
-        files = data_files(volume)
+        kind = device_kind(volume)
+        if kind == "camera":
+            files = camera_files(volume)
+        elif kind == "bracelet":
+            files = data_files(volume)
+        else:
+            print(f"  {volume}  (not a known device, ignored)")
+            continue
         fresh = [f for f in files if file_key(f, volume.name) not in seen]
         size = sum(f.stat().st_size for f in files) / (1024 * 1024)
-        print(f"  {volume}")
+        print(f"  {volume}  [{kind}]")
         print(f"    {len(files)} files, {len(fresh)} new, {size:.1f} MB")
         for sample in files[:5]:
             print(f"      {sample.name}")
@@ -1489,6 +1516,12 @@ def device_summary():
             # Fall back to file times for sessions collected before metadata
             if not sessions:
                 found = list(sessions_dir.rglob("*.jsonl"))
+                videos = [p for p in sessions_dir.rglob("*")
+                          if p.suffix.upper() in CAMERA_VIDEO_EXTS]
+                if videos and not found:
+                    found, kind = videos, kind or "camera"
+                elif found:
+                    kind = kind or "bracelet"
                 sessions = len(found)
                 size = sum(f.stat().st_size for f in found)
 

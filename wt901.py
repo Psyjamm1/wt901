@@ -1678,18 +1678,49 @@ def install(delete_after):
         return 0
 
     if platform.system() == "Linux":
-        args = f"{python} {script} --once"
+        # A systemd *user* service that polls, rather than a udev rule.
+        # udev runs its hooks as root (wrong home dir, wrong /media path)
+        # and fires before the desktop session has mounted the volume, so
+        # a udev-triggered run usually finds nothing. Polling as the real
+        # user sees exactly the mounts the user sees.
+        args = f"{python} {script}"
         if delete_after:
             args += " --delete"
-        rule = (
-            'ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", '
-            f'RUN+="/usr/bin/systemd-run --no-block {args}"\n'
-        )
-        print("\nThe udev rule must be installed as root.")
-        print("Run these two commands:\n")
-        print(f"  echo '{rule.strip()}' | "
-              "sudo tee /etc/udev/rules.d/99-wt901.rules")
-        print("  sudo udevadm control --reload-rules\n")
+        unit_dir = Path.home() / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        unit = unit_dir / "wt901.service"
+        unit.write_text(f"""[Unit]
+Description=WT901 bracelet and camera collector
+
+[Service]
+ExecStart={args}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+""")
+        steps = [
+            ["systemctl", "--user", "daemon-reload"],
+            ["systemctl", "--user", "enable", "--now", "wt901.service"],
+        ]
+        for cmd in steps:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"{' '.join(cmd)} failed: {result.stderr.strip()}")
+                return 1
+
+        print(f"\nservice installed: {unit}")
+        print("it polls for devices every "
+              f"{POLL_INTERVAL:.0f} s and restarts itself if it crashes")
+        print("\ncheck it:   systemctl --user status wt901")
+        print("live log:   journalctl --user -u wt901 -f")
+        print(f"remove:     python3 {script} --uninstall")
+        print("\nFor an unattended dock two more things are needed:")
+        print("  1. keep the service running with nobody logged in:")
+        print(f"       sudo loginctl enable-linger {Path.home().name}")
+        print("  2. turn on automatic login (Settings > Users), because")
+        print("     USB volumes are only auto-mounted inside a desktop session\n")
         return 0
 
     print(f"auto-run is not supported on {platform.system()}")
@@ -1709,9 +1740,13 @@ def uninstall():
         return 0
 
     if platform.system() == "Linux":
-        print("\nRun:\n")
-        print("  sudo rm /etc/udev/rules.d/99-wt901.rules")
-        print("  sudo udevadm control --reload-rules\n")
+        unit = Path.home() / ".config" / "systemd" / "user" / "wt901.service"
+        subprocess.run(["systemctl", "--user", "disable", "--now", "wt901.service"],
+                       capture_output=True)
+        if unit.exists():
+            unit.unlink()
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print("service removed")
         return 0
 
     return 1

@@ -39,9 +39,12 @@ import hashlib
 import json
 import os
 import platform
+import re
+import socket
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +56,16 @@ from pathlib import Path
 OUT_DIR = Path.home() / "Projects" / "wt901-data"
 
 POLL_INTERVAL = 10.0      # watch-mode poll period, seconds
+
+# Upload to cloud storage through rclone. Empty string disables uploading.
+# The value is an rclone remote plus path, e.g. "cloud:farm-data".
+# Set it here or pass --remote on the command line.
+UPLOAD_REMOTE = ""
+UPLOAD_INTERVAL = 30.0    # seconds between upload passes
+DELETE_AFTER_UPLOAD = False   # free local disk once a session is verified remotely
+
+READY_SHOW_MINUTES = 30   # how long the dashboard keeps saying "can be taken"
+STALE_HOURS = 36          # flag a device that has not synced for this long
 SETTLE_DELAY = 3.0        # settle time after a volume mounts
 
 MIN_FILE_SIZE = 128       # smaller files are treated as junk, bytes
@@ -152,6 +165,53 @@ def save_state(seen):
             json.dump(sorted(seen), handle, indent=1)
     except OSError as exc:
         log(f"  could not save state: {exc}")
+
+
+# --------------------------------------------------------------------------
+# Live state shared with the dashboard
+# --------------------------------------------------------------------------
+
+def state_dir():
+    return OUT_DIR / "state"
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def read_state(name):
+    try:
+        return json.loads((state_dir() / f"{name}.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(name, **fields):
+    """Merge fields into a small JSON file, written atomically.
+
+    The collector, the uploader and the dashboard are separate processes
+    or threads; replace() guarantees a reader never sees half a file.
+    """
+    try:
+        folder = state_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        data = read_state(name)
+        data.update(fields)
+        data["updated"] = now_iso()
+        tmp = folder / f".{name}.tmp"
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(folder / f"{name}.json")
+    except OSError:
+        pass
+
+
+def seconds_since(iso):
+    if not iso:
+        return None
+    try:
+        return (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
+    except ValueError:
+        return None
 
 
 def safe_name(text):
@@ -506,15 +566,15 @@ def digest(path, chunk=1024 * 1024):
 # Single-instance lock
 # --------------------------------------------------------------------------
 
-def lock_path():
-    return OUT_DIR / "collector.lock"
+def lock_path(name="collector"):
+    return OUT_DIR / f"{name}.lock"
 
 
 class Busy(Exception):
     """Another instance is already working on this volume."""
 
 
-def acquire_lock(stale_after=900):
+def acquire_lock(stale_after=900, name="collector"):
     """Take an exclusive lock, or raise Busy.
 
     The monitor and the launchd agent both react to a mount, so without
@@ -523,7 +583,7 @@ def acquire_lock(stale_after=900):
     is ignored after stale_after seconds.
     """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = lock_path()
+    path = lock_path(name)
 
     if path.exists():
         try:
@@ -543,9 +603,9 @@ def acquire_lock(stale_after=900):
     return path
 
 
-def release_lock():
+def release_lock(name="collector"):
     try:
-        lock_path().unlink()
+        lock_path(name).unlink()
     except OSError:
         pass
 
@@ -688,6 +748,8 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
     save_state(seen)
 
     if not copied:
+        write_state(safe_name(volume.name), phase="error", finished=now_iso(),
+                    error=f"{len(failed)} videos unreadable")
         notify("Camera download failed",
                f"{len(failed)} videos unreadable. Camera data is intact.")
         return False
@@ -722,6 +784,10 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
         log("  camera not cleared (no --delete)")
 
     copied_bytes = sum(t.stat().st_size for _, t in copied)
+    (session / ".complete").write_text(now_iso())
+    write_state(safe_name(volume.name), phase="done", kind="camera",
+                finished=now_iso(), last_done=now_iso(), files=len(copied),
+                bytes=copied_bytes, percent=100, error=None)
     notify("Camera footage collected",
            f"{len(copied)} videos, {human(copied_bytes)}. The camera can be taken.")
     unmount(volume)
@@ -739,12 +805,49 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
         log(f"volume {volume.name}: skipped, {who} is already collecting")
         return False
 
+    dev = safe_name(volume.name)
+    kind = device_kind(volume)
     try:
-        if device_kind(volume) == "camera":
-            return _collect_camera(volume, delete_after, progress, done_bytes)
-        return _collect(volume, delete_after, progress, done_bytes)
+        files = camera_files(volume) if kind == "camera" else data_files(volume)
+        seen = load_state()
+        total = sum(f.stat().st_size for f in files
+                    if file_key(f, volume.name) not in seen)
+    except OSError:
+        total = 0
+
+    write_state(dev, phase="checking", kind=kind, started=now_iso(),
+                volume=str(volume), total=total, percent=0, file=None, error=None)
+
+    if done_bytes is None:
+        done_bytes = [0]
+    last_write = [0.0]
+
+    def tracker(got, file_total, name=""):
+        if progress:
+            progress(got, file_total, name)
+        moment = time.monotonic()
+        if moment - last_write[0] < 0.5:
+            return
+        last_write[0] = moment
+        overall = done_bytes[0] + got
+        percent = int(100 * overall / total) if total else 0
+        write_state(dev, phase="copying", file=name, copied=overall,
+                    percent=min(percent, 99))
+
+    try:
+        if kind == "camera":
+            ok = _collect_camera(volume, delete_after, tracker, done_bytes)
+        else:
+            ok = _collect(volume, delete_after, tracker, done_bytes)
+    except Exception as exc:
+        write_state(dev, phase="error", finished=now_iso(), error=str(exc)[:200])
+        raise
     finally:
         release_lock()
+
+    if not ok and read_state(dev).get("phase") in ("checking", "copying", "decoding"):
+        write_state(dev, phase="nothing_new", finished=now_iso())
+    return ok
 
 
 def _collect(volume, delete_after, progress=None, done_bytes=None):
@@ -811,6 +914,8 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
 
     if not copied:
         log("nothing could be copied")
+        write_state(safe_name(volume.name), phase="error", finished=now_iso(),
+                    error=f"{len(failed)} files unreadable")
         notify("Download failed",
                f"{len(failed)} files unreadable. Card data is intact.")
         return False
@@ -821,6 +926,7 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
         log(f"unreadable, left on the card: {names}")
 
     # Decode to JSON Lines, merging across file boundaries
+    write_state(safe_name(volume.name), phase="decoding")
     raw_files = [t for _, t in copied]
     samples_total, jsonl_total = convert_all(raw_files, session)
     if jsonl_total:
@@ -871,6 +977,11 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
     else:
         log("  card not cleared (no --delete)")
 
+    (session / ".complete").write_text(now_iso())
+    write_state(safe_name(volume.name), phase="done", kind="bracelet",
+                finished=now_iso(), last_done=now_iso(), files=len(copied),
+                bytes=dir_bytes(session), samples=samples_total,
+                percent=100, error=None)
     notify(
         "Sensor data collected",
         f"{len(copied)} files, {total_mb:.0f} MB, "
@@ -878,6 +989,161 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
     )
     unmount(volume)
     return True
+
+
+# --------------------------------------------------------------------------
+# Upload to cloud storage (rclone)
+# --------------------------------------------------------------------------
+
+MARKERS = (".complete", ".uploaded")
+
+
+def session_dirs():
+    found = []
+    if not OUT_DIR.is_dir():
+        return found
+    for device in sorted(OUT_DIR.iterdir()):
+        sessions = device / "sessions"
+        if device.is_dir() and sessions.is_dir():
+            found.extend(p for p in sessions.iterdir() if p.is_dir())
+    return found
+
+
+def session_complete(path):
+    if (path / ".complete").exists():
+        return True
+    # Sessions collected before completion markers existed: trust them
+    # once they have been quiet for an hour.
+    try:
+        return time.time() - path.stat().st_mtime > 3600 and any(path.iterdir())
+    except OSError:
+        return False
+
+
+def dir_bytes(path):
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_file() and item.name not in MARKERS:
+            try:
+                total += item.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def pending_sessions():
+    return sorted((p for p in session_dirs()
+                   if not (p / ".uploaded").exists() and session_complete(p)),
+                  key=lambda p: p.name)
+
+
+def rclone_args():
+    args = []
+    for marker in MARKERS:
+        args += ["--exclude", marker]
+    return args
+
+
+def upload_session(path, rclone):
+    device = path.parent.parent.name
+    label = f"{device}/{path.name}"
+    dest = f"{UPLOAD_REMOTE.rstrip('/')}/{device}/{path.name}"
+    size = dir_bytes(path)
+
+    write_state("uploader", phase="uploading", session=label, bytes=size,
+                percent=0, started=now_iso(), error=None)
+    log(f"upload {label} ({human(size)}) -> {dest}")
+
+    cmd = [rclone, "copy", str(path), dest, "--checksum",
+           "--retries", "3", "--low-level-retries", "10",
+           "--stats", "2s", "--stats-one-line",
+           "--stats-log-level", "NOTICE"] + rclone_args()
+    last_error = ""
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            match = re.search(r"(\d+)%", line)
+            if match:
+                write_state("uploader", percent=int(match.group(1)))
+            if "ERROR" in line:
+                last_error = line.strip()[-200:]
+        code = proc.wait()
+    except OSError as exc:
+        code, last_error = -1, str(exc)
+
+    if code != 0:
+        message = last_error or f"rclone exited with code {code}"
+        write_state("uploader", phase="error", error=message, failed_at=now_iso())
+        log(f"  upload failed: {message}")
+        return False
+
+    # Only a remote copy that rclone has checked counts as uploaded
+    check = subprocess.run([rclone, "check", str(path), dest, "--one-way"]
+                           + rclone_args(), capture_output=True, text=True)
+    if check.returncode != 0:
+        message = "remote copy does not match local files"
+        write_state("uploader", phase="error", error=message, failed_at=now_iso())
+        log(f"  upload failed: {message}")
+        return False
+
+    (path / ".uploaded").write_text(json.dumps(
+        {"uploaded": now_iso(), "dest": dest, "bytes": size}, indent=1))
+
+    if DELETE_AFTER_UPLOAD:
+        for item in path.iterdir():
+            if item.is_file() and item.name not in MARKERS \
+                    and not item.name.endswith(".meta.json"):
+                try:
+                    item.unlink()
+                except OSError:
+                    pass
+
+    write_state("uploader", last_ok=now_iso(), last_session=label, percent=100)
+    log(f"  uploaded and verified {label}")
+    return True
+
+
+def upload_pass():
+    """Upload every finished session that is not in the cloud yet."""
+    if not UPLOAD_REMOTE:
+        return
+    pending = pending_sessions()
+    write_state("uploader", remote=UPLOAD_REMOTE, pending=len(pending),
+                pending_bytes=sum(dir_bytes(p) for p in pending))
+
+    rclone = shutil.which("rclone")
+    if not rclone:
+        write_state("uploader", phase="error", error="rclone is not installed")
+        return
+    if not pending:
+        write_state("uploader", phase="idle", error=None)
+        return
+
+    try:
+        acquire_lock(stale_after=6 * 3600, name="uploader")
+    except Busy:
+        return
+    try:
+        for index, path in enumerate(pending):
+            if not upload_session(path, rclone):
+                return
+            rest = pending[index + 1:]
+            write_state("uploader", pending=len(rest),
+                        pending_bytes=sum(dir_bytes(p) for p in rest))
+        write_state("uploader", phase="idle", error=None)
+    finally:
+        release_lock("uploader")
+
+
+def uploader_loop():
+    while True:
+        try:
+            upload_pass()
+        except Exception as exc:
+            log(f"uploader error: {exc}")
+            write_state("uploader", phase="error", error=str(exc)[:200])
+        time.sleep(UPLOAD_INTERVAL)
 
 
 def run_once(delete_after):
@@ -896,6 +1162,7 @@ def run_once(delete_after):
     if not worked:
         names = ", ".join(v.name for v in volumes)
         log(f"triggered on connect: no new recordings on ({names})")
+    upload_pass()
     return 0
 
 
@@ -1013,6 +1280,9 @@ def watch(delete_after):
         log("card cleanup enabled")
     if VOLUME_FILTER:
         log(f"volume filter: {VOLUME_FILTER!r}")
+    if UPLOAD_REMOTE:
+        log(f"uploading to {UPLOAD_REMOTE} every {UPLOAD_INTERVAL:.0f} s")
+        threading.Thread(target=uploader_loop, daemon=True).start()
 
     known = set()
     while True:
@@ -1621,6 +1891,226 @@ def show_status(as_json=False):
 
 
 # --------------------------------------------------------------------------
+# Live dashboard
+# --------------------------------------------------------------------------
+
+C = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
+    "blue": "\033[34m", "cyan": "\033[36m",
+    "on_red": "\033[41;97;1m", "on_green": "\033[42;30;1m",
+    "on_yellow": "\033[43;30;1m",
+}
+
+
+def paint(text, *styles):
+    return "".join(C[s] for s in styles) + text + C["reset"]
+
+
+def git_version():
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent),
+             "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3)
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "-"
+
+
+def tail_log(lines=8):
+    path = OUT_DIR / "collector.log"
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 16384))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    return text.splitlines()[-lines:]
+
+
+BAD_WORDS = ("fail", "error", "unreadable", "skipped", "stalled")
+
+
+def device_status(name, st, docked, summary_last):
+    """Return (label, colour, detail) for one device - worded for a worker."""
+    phase = st.get("phase")
+    age = seconds_since(st.get("updated"))
+    finished = seconds_since(st.get("finished"))
+
+    if phase in ("checking", "copying", "decoding"):
+        if age is not None and age > 120:
+            return "STALLED", "on_red", "no progress for 2 min - see log"
+        pct = st.get("percent") or 0
+        what = {"checking": "CHECKING", "copying": f"COPYING {pct}%",
+                "decoding": "PROCESSING"}[phase]
+        return what + " - DO NOT UNPLUG", "on_yellow", st.get("file") or ""
+
+    if phase == "error" and (docked or (finished is not None and finished < 3600)):
+        return "ERROR", "on_red", st.get("error") or "see log"
+
+    if phase == "done" and finished is not None \
+            and finished < READY_SHOW_MINUTES * 60:
+        detail = f"{st.get('files', 0)} files, {human(st.get('bytes', 0))}"
+        return "DONE - CAN BE TAKEN", "on_green", detail
+
+    if docked and phase == "nothing_new":
+        return "NOTHING NEW - CAN BE TAKEN", "on_green", ""
+
+    if docked:
+        return "CONNECTED", "cyan", "waiting"
+
+    last = st.get("last_done") or summary_last
+    idle = seconds_since(last)
+    if idle is not None and idle > STALE_HOURS * 3600:
+        return f"NO DATA FOR {idle / 3600:.0f} h", "red", "check the device"
+    return "not connected", "dim", f"last sync {ago(last)}"
+
+
+def render_dashboard(version, host, summary, pending, width):
+    lines = []
+    rule = paint("-" * min(width, 100), "dim")
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"{stamp}  {paint(host, 'cyan', 'bold')}  "
+                 f"wt901 {paint(version, 'dim')}")
+    lines.append(rule)
+
+    # Storage
+    space = free_space()
+    if space:
+        used = 1 - space["free"] / space["total"]
+        filled = int(used * 30)
+        colour = "red" if used > 0.9 else "yellow" if used > 0.75 else "green"
+        gauge = paint("#" * filled, colour) + paint("." * (30 - filled), "dim")
+        lines.append(f"{paint('STORAGE', 'blue', 'bold'):<20} {used * 100:3.0f}% "
+                     f"[{gauge}]  {human(space['free'])} free of "
+                     f"{human(space['total'])}")
+    lines.append("")
+
+    # Devices
+    docked = {}
+    for volume in find_volumes():
+        kind = device_kind(volume)
+        if kind:
+            docked[safe_name(volume.name)] = kind
+
+    by_name = {d["device"]: d for d in summary}
+    states = {}
+    if state_dir().is_dir():
+        for path in state_dir().glob("*.json"):
+            if path.stem != "uploader":
+                states[path.stem] = read_state(path.stem)
+
+    pending_by_dev = {}
+    for path in pending:
+        dev = path.parent.parent.name
+        pending_by_dev[dev] = pending_by_dev.get(dev, 0) + 1
+
+    names = sorted(set(by_name) | set(states) | set(docked))
+    banners = []
+    lines.append(paint("DEVICES", "blue", "bold"))
+    if not names:
+        lines.append(paint("  no devices seen yet", "dim"))
+
+    for name in names:
+        d = by_name.get(name, {})
+        st = states.get(name, {})
+        kind = docked.get(name) or st.get("kind") or d.get("kind") or "?"
+        label, colour, detail = device_status(
+            name, st, name in docked, d.get("last"))
+
+        if colour in ("on_yellow", "on_green", "on_red"):
+            banners.append((name, label, colour))
+
+        upload = ""
+        if UPLOAD_REMOTE:
+            waiting = pending_by_dev.get(name, 0)
+            upload = (paint(f"cloud: {waiting} waiting", "yellow") if waiting
+                      else paint("cloud: up to date", "green"))
+
+        shown = paint(f" {label} ", colour) if colour.startswith("on_") \
+            else paint(label, colour)
+        lines.append(f"  {paint(name, 'bold'):<20} {kind:<9} {shown}  "
+                     f"{paint(detail, 'dim')}  {upload}")
+    lines.append("")
+
+    # Uploader
+    up = read_state("uploader")
+    head = paint("CLOUD UPLOAD", "blue", "bold")
+    if not UPLOAD_REMOTE:
+        lines.append(f"{head}  {paint('off (no --remote set)', 'dim')}")
+    else:
+        phase = up.get("phase")
+        waiting = len(pending)
+        wbytes = human(sum(dir_bytes(p) for p in pending))
+        if phase == "uploading" and (seconds_since(up.get("updated")) or 0) < 300:
+            state = paint(f"uploading {up.get('session')}  {up.get('percent', 0)}%",
+                          "yellow", "bold")
+        elif phase == "error":
+            state = paint(f"ERROR: {up.get('error')}", "red", "bold") + \
+                paint(f"  (retrying every {UPLOAD_INTERVAL:.0f} s)", "dim")
+        elif waiting:
+            state = paint(f"{waiting} sessions waiting", "yellow")
+        else:
+            state = paint("idle, nothing to upload", "green")
+        lines.append(f"{head}  {state}")
+        lines.append(f"  target {paint(UPLOAD_REMOTE, 'cyan')}   "
+                     f"waiting {waiting} ({wbytes})   "
+                     f"last success {ago(up.get('last_ok'))}")
+    lines.append("")
+
+    # Recent events
+    lines.append(paint("RECENT", "blue", "bold"))
+    for entry in tail_log(8):
+        entry = entry[:width - 2]
+        bad = any(word in entry.lower() for word in BAD_WORDS)
+        lines.append("  " + (paint(entry, "red") if bad else paint(entry, "dim")))
+
+    # Big banner for whoever is standing at the dock
+    top = []
+    order = {"on_red": 0, "on_yellow": 1, "on_green": 2}
+    for name, label, colour in sorted(banners, key=lambda b: order[b[2]]):
+        top.append(paint(f"   {name}:  {label}   ".ljust(min(width, 100)), colour))
+    if top:
+        top.append("")
+    return lines[:2] + top + lines[2:]
+
+
+def dashboard(refresh=1.0):
+    # The service knows where it uploads; reuse that so the dashboard
+    # works over SSH without repeating --remote every time.
+    if not UPLOAD_REMOTE and read_state("uploader").get("remote"):
+        globals()["UPLOAD_REMOTE"] = read_state("uploader")["remote"]
+    version, host = git_version(), socket.gethostname()
+    cache = {"at": 0.0, "summary": [], "pending": []}
+    sys.stdout.write("\033[2J\033[?25l")
+    try:
+        while True:
+            if time.time() - cache["at"] > 10:
+                cache["summary"] = device_summary()
+                cache["pending"] = pending_sessions() if UPLOAD_REMOTE else []
+                cache["pending_bytes"] = sum(dir_bytes(p) for p in cache["pending"])
+                cache["at"] = time.time()
+            width = shutil.get_terminal_size((100, 30)).columns
+            lines = render_dashboard(version, host, cache["summary"],
+                                     cache["pending"], width)
+            sys.stdout.write("\033[H" + "\n".join(l + "\033[K" for l in lines)
+                             + "\n\033[J")
+            sys.stdout.flush()
+            time.sleep(refresh)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
 # Auto-run on device connect
 # --------------------------------------------------------------------------
 
@@ -1636,6 +2126,8 @@ def install(delete_after):
         args = [str(python), str(script), "--once"]
         if delete_after:
             args.append("--delete")
+        if UPLOAD_REMOTE:
+            args += ["--remote", UPLOAD_REMOTE]
         entries = "".join(f"\n        <string>{a}</string>" for a in args)
 
         plist = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -1686,6 +2178,8 @@ def install(delete_after):
         args = f"{python} {script}"
         if delete_after:
             args += " --delete"
+        if UPLOAD_REMOTE:
+            args += f" --remote {UPLOAD_REMOTE}"
         unit_dir = Path.home() / ".config" / "systemd" / "user"
         unit_dir.mkdir(parents=True, exist_ok=True)
         unit = unit_dir / "wt901.service"
@@ -1710,7 +2204,19 @@ WantedBy=default.target
                 print(f"{' '.join(cmd)} failed: {result.stderr.strip()}")
                 return 1
 
+        # Dashboard on the dock's own screen, for whoever takes the devices
+        autostart = Path.home() / ".config" / "autostart"
+        autostart.mkdir(parents=True, exist_ok=True)
+        remote_arg = f" --remote {UPLOAD_REMOTE}" if UPLOAD_REMOTE else ""
+        (autostart / "wt901-dashboard.desktop").write_text(f"""[Desktop Entry]
+Type=Application
+Name=WT901 dashboard
+Exec=gnome-terminal --full-screen -- {python} {script} --dashboard{remote_arg}
+X-GNOME-Autostart-enabled=true
+""")
+
         print(f"\nservice installed: {unit}")
+        print("dashboard will open full-screen after login")
         print("it polls for devices every "
               f"{POLL_INTERVAL:.0f} s and restarts itself if it crashes")
         print("\ncheck it:   systemctl --user status wt901")
@@ -1720,7 +2226,11 @@ WantedBy=default.target
         print("  1. keep the service running with nobody logged in:")
         print(f"       sudo loginctl enable-linger {Path.home().name}")
         print("  2. turn on automatic login (Settings > Users), because")
-        print("     USB volumes are only auto-mounted inside a desktop session\n")
+        print("     USB volumes are only auto-mounted inside a desktop session")
+        print("  3. keep the screen awake for the dashboard:")
+        bus = "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus"
+        print(f"       {bus} gsettings set org.gnome.desktop.session idle-delay 0")
+        print(f"       {bus} gsettings set org.gnome.desktop.screensaver lock-enabled false\n")
         return 0
 
     print(f"auto-run is not supported on {platform.system()}")
@@ -1745,6 +2255,9 @@ def uninstall():
                        capture_output=True)
         if unit.exists():
             unit.unlink()
+        kiosk = Path.home() / ".config" / "autostart" / "wt901-dashboard.desktop"
+        if kiosk.exists():
+            kiosk.unlink()
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
         print("service removed")
         return 0
@@ -1771,6 +2284,12 @@ def main():
                         help="remove the auto-run agent")
     parser.add_argument("--volume", metavar="NAME",
                         help="only use volumes whose name contains this")
+    parser.add_argument("--dashboard", action="store_true",
+                        help="full-screen live dashboard")
+    parser.add_argument("--upload", action="store_true",
+                        help="upload finished sessions once, then exit")
+    parser.add_argument("--remote", metavar="REMOTE",
+                        help="rclone remote for uploads, e.g. cloud:farm-data")
     parser.add_argument("--status", action="store_true",
                         help="overview of all sensors and collected data")
     parser.add_argument("--json", action="store_true",
@@ -1800,6 +2319,9 @@ def main():
     if args.keep_raw:
         globals()["KEEP_RAW"] = True
 
+    if args.remote:
+        globals()["UPLOAD_REMOTE"] = args.remote
+
     if args.rate:
         codes = {20: (0x07, 0x05), 50: (0x08, 0x04),
                  100: (0x09, 0x03), 200: (0x0B, 0x02)}
@@ -1815,6 +2337,17 @@ def main():
                     else "verify" if args.verify
                     else "listen" if args.listen else "apply")
             sys.exit(asyncio.run(ble_main(mode)))
+        elif args.dashboard:
+            dashboard()
+        elif args.upload:
+            if not UPLOAD_REMOTE:
+                print("set a target with --remote, e.g. --remote cloud:farm-data")
+                sys.exit(1)
+            globals()["QUIET"] = False
+            upload_pass()
+            up = read_state("uploader")
+            print(f"uploader: {up.get('phase')}  "
+                  f"waiting {up.get('pending', 0)}  error {up.get('error')}")
         elif args.status:
             show_status(args.json)
         elif args.list:

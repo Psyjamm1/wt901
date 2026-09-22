@@ -64,6 +64,7 @@ UPLOAD_REMOTE = ""
 UPLOAD_INTERVAL = 30.0    # seconds between upload passes
 DELETE_AFTER_UPLOAD = False   # free local disk once a session is verified remotely
 
+DEVICE_RETRY = 60.0       # seconds before retrying a device that failed
 READY_SHOW_MINUTES = 30   # how long the dashboard keeps saying "can be taken"
 STALE_HOURS = 36          # flag a device that has not synced for this long
 SETTLE_DELAY = 3.0        # settle time after a volume mounts
@@ -622,14 +623,35 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
     the checksums would differ for no real reason. We hash exactly what
     we read, then compare it against what landed on disk.
     """
-    source_hash = hashlib.sha256()
-    copied_bytes = 0
     try:
         total = source.stat().st_size
     except OSError:
         total = 0
 
-    with open(source, "rb") as src, open(target, "wb") as dst:
+    # Copy into a .part file and rename only once it is verified. A half
+    # copied file therefore never looks finished, and an interrupted
+    # transfer can pick up where it stopped instead of starting over.
+    part = target.with_name(target.name + ".part")
+    resume_from = 0
+    source_hash = hashlib.sha256()
+    if part.exists():
+        done = part.stat().st_size
+        if 0 < done <= total:
+            with open(part, "rb") as existing:
+                while True:
+                    block = existing.read(chunk)
+                    if not block:
+                        break
+                    source_hash.update(block)
+            resume_from = done
+        else:
+            part.unlink()
+
+    copied_bytes = resume_from
+    mode = "ab" if resume_from else "wb"
+    with open(source, "rb") as src, open(part, mode) as dst:
+        if resume_from:
+            src.seek(resume_from)
         while True:
             block = src.read(chunk)
             if not block:
@@ -641,7 +663,7 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
                 on_progress(copied_bytes, total)
 
     target_hash = hashlib.sha256()
-    with open(target, "rb") as dst:
+    with open(part, "rb") as dst:
         while True:
             block = dst.read(chunk)
             if not block:
@@ -649,8 +671,10 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
             target_hash.update(block)
 
     if source_hash.hexdigest() != target_hash.hexdigest():
+        part.unlink()
         raise OSError("copy does not match the bytes read")
 
+    part.replace(target)
     return copied_bytes
 
 
@@ -716,11 +740,8 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
                 break
             except OSError as exc:
                 log(f"  {source.name}: attempt {attempt} failed - {exc}")
-                try:
-                    if target.exists():
-                        target.unlink()
-                except OSError:
-                    pass
+                # The .part file is deliberately kept: the next attempt,
+                # or the next time the device is plugged in, resumes from it.
                 if attempt < COPY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
 
@@ -799,13 +820,16 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
     if not is_sensor(volume):
         return False
 
+    dev = safe_name(volume.name)
+    # One lock per device, not one for the whole program: two cameras in
+    # the dock must not block each other.
+    lock_name = f"collector-{dev}"
     try:
-        acquire_lock()
+        acquire_lock(name=lock_name)
     except Busy as who:
-        log(f"volume {volume.name}: skipped, {who} is already collecting")
+        log(f"volume {volume.name}: skipped, {who} is already collecting it")
         return False
 
-    dev = safe_name(volume.name)
     kind = device_kind(volume)
     try:
         files = camera_files(volume) if kind == "camera" else data_files(volume)
@@ -843,7 +867,7 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
         write_state(dev, phase="error", finished=now_iso(), error=str(exc)[:200])
         raise
     finally:
-        release_lock()
+        release_lock(lock_name)
 
     if not ok and read_state(dev).get("phase") in ("checking", "copying", "decoding"):
         write_state(dev, phase="nothing_new", finished=now_iso())
@@ -893,11 +917,8 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
                 break
             except OSError as exc:
                 log(f"  {source.name}: attempt {attempt} failed - {exc}")
-                try:
-                    if target.exists():
-                        target.unlink()      # never leave a partial copy behind
-                except OSError:
-                    pass
+                # The .part file is deliberately kept: the next attempt,
+                # or the next time the device is plugged in, resumes from it.
                 if attempt < COPY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
 
@@ -1216,6 +1237,7 @@ def monitor(delete_after):
     print()
 
     known = set()
+    retry_at = {}
     spinner = "|/-\\"
     tick = 0
 
@@ -1224,8 +1246,10 @@ def monitor(delete_after):
         sensors = [v for v in volumes if is_sensor(v)]
         current = {v.name for v in sensors}
         known &= current
+        retry_at = {k: v for k, v in retry_at.items() if k in current}
 
-        fresh = [v for v in sensors if v.name not in known]
+        fresh = [v for v in sensors if v.name not in known
+                 and time.monotonic() >= retry_at.get(v.name, 0)]
 
         if not fresh:
             tick += 1
@@ -1256,6 +1280,12 @@ def monitor(delete_after):
                             f"{human(overall)}  {speed:.0f} KB/s  {name}")
 
             result = collect(volume, delete_after, progress, done_bytes)
+            phase = read_state(safe_name(volume.name)).get("phase")
+            if result or phase == "nothing_new":
+                known.add(volume.name)
+            else:
+                retry_at[volume.name] = time.monotonic() + DEVICE_RETRY
+                print(f"    will retry in {DEVICE_RETRY:.0f} s")
             screen.done()
             if result:
                 made = sorted((OUT_DIR / "sessions").glob("*/session_*.jsonl"),
@@ -1268,7 +1298,6 @@ def monitor(delete_after):
                       f"the sensor can be taken")
             else:
                 print("    no new recordings found")
-            known.add(volume.name)
             print()
 
 
@@ -1284,19 +1313,37 @@ def watch(delete_after):
         log(f"uploading to {UPLOAD_REMOTE} every {UPLOAD_INTERVAL:.0f} s")
         threading.Thread(target=uploader_loop, daemon=True).start()
 
-    known = set()
+    done = set()        # finished while this volume stayed mounted
+    retry_at = {}       # volumes that failed, and when to try them again
+
     while True:
         volumes = find_volumes()
         current = {v.name for v in volumes}
-        known &= current                      # forget volumes that went away
+        done &= current                       # forget volumes that went away
+        retry_at = {k: v for k, v in retry_at.items() if k in current}
 
         for volume in volumes:
-            if volume.name in known:
+            name = volume.name
+            if name in done:
                 continue
+            if time.monotonic() < retry_at.get(name, 0):
+                continue
+
             time.sleep(SETTLE_DELAY)
-            if volume.is_dir():
-                collect(volume, delete_after)
-            known.add(volume.name)
+            if not volume.is_dir():
+                continue
+
+            ok = collect(volume, delete_after)
+            phase = read_state(safe_name(name)).get("phase")
+            if ok or phase == "nothing_new":
+                done.add(name)
+                retry_at.pop(name, None)
+            else:
+                # A yanked cable, a busy device or an unreadable file: try
+                # again shortly. Writing the device off until it is
+                # unplugged would leave it stuck showing an old error.
+                retry_at[name] = time.monotonic() + DEVICE_RETRY
+                log(f"volume {name}: will retry in {DEVICE_RETRY:.0f} s")
 
         time.sleep(POLL_INTERVAL)
 
@@ -1811,14 +1858,19 @@ def device_summary():
 
 def collector_state():
     """Is a collection running right now, and how long has it been going?"""
-    path = lock_path()
-    if not path.exists():
-        return None
     try:
-        age = time.time() - path.stat().st_mtime
-        return {"holder": path.read_text().strip(), "age_s": round(age)}
+        locks = sorted(OUT_DIR.glob("collector*.lock"))
     except OSError:
         return None
+    for path in locks:
+        try:
+            age = time.time() - path.stat().st_mtime
+            who = path.stem.replace("collector-", "")
+            return {"holder": f"{who} ({path.read_text().strip()})",
+                    "age_s": round(age)}
+        except OSError:
+            continue
+    return None
 
 
 def free_space():

@@ -1239,7 +1239,34 @@ def session_dirs():
     return found
 
 
+def device_busy(device):
+    """True while a collector is working on this device."""
+    if read_state(device).get("phase") in ("checking", "copying", "decoding"):
+        lock = lock_path(f"collector-{device}")
+        try:
+            if lock.exists() and holder_alive(lock.read_text()):
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def session_complete(path):
+    """Is this session finished and safe to send to the cloud?
+
+    Uploading a session that is still being written makes rclone fail
+    with "source file is being updated" - and worse, could publish half
+    a video. A session folder is reused while a transfer resumes, so its
+    age alone says nothing.
+    """
+    try:
+        if any(path.glob("*.part")):
+            return False          # a transfer is still unfinished here
+        if device_busy(path.parent.parent.name):
+            return False
+    except OSError:
+        return False
+
     if (path / ".complete").exists():
         return True
     # Sessions collected before completion markers existed: trust them
@@ -1253,7 +1280,8 @@ def session_complete(path):
 def dir_bytes(path):
     total = 0
     for item in path.rglob("*"):
-        if item.is_file() and item.name not in MARKERS:
+        if item.is_file() and item.name not in MARKERS \
+                and item.suffix != ".part":
             try:
                 total += item.stat().st_size
             except OSError:
@@ -1271,6 +1299,8 @@ def rclone_args():
     args = []
     for marker in MARKERS:
         args += ["--exclude", marker]
+    # Never publish a partially transferred file
+    args += ["--exclude", "*.part"]
     return args
 
 

@@ -65,6 +65,7 @@ UPLOAD_INTERVAL = 30.0    # seconds between upload passes
 DELETE_AFTER_UPLOAD = False   # free local disk once a session is verified remotely
 
 DEVICE_RETRY = 60.0       # seconds before retrying a device that failed
+MAX_PARALLEL = 4          # devices collected at the same time
 READY_SHOW_MINUTES = 30   # how long the dashboard keeps saying "can be taken"
 STALE_HOURS = 36          # flag a device that has not synced for this long
 SETTLE_DELAY = 3.0        # settle time after a volume mounts
@@ -495,7 +496,10 @@ def device_kind(volume):
     except OSError:
         return None
 
-    if volume.name.upper() in CAMERA_SKIP_LABELS:
+    # A second camera's built-in storage mounts as OsmoAction1 and so on,
+    # so match on the prefix rather than the exact label.
+    if any(volume.name.upper().startswith(label)
+           for label in CAMERA_SKIP_LABELS):
         return None
     dcim = volume / "DCIM"
     try:
@@ -1315,6 +1319,22 @@ def watch(delete_after):
 
     done = set()        # finished while this volume stayed mounted
     retry_at = {}       # volumes that failed, and when to try them again
+    active = {}         # volumes being collected right now
+    results = {}        # what each finished worker reported
+
+    def worker(volume):
+        name = volume.name
+        try:
+            time.sleep(SETTLE_DELAY)
+            if not volume.is_dir():
+                results[name] = False
+                return
+            ok = collect(volume, delete_after)
+            phase = read_state(safe_name(name)).get("phase")
+            results[name] = bool(ok) or phase == "nothing_new"
+        except Exception as exc:
+            log(f"volume {name}: collection crashed - {exc}")
+            results[name] = False
 
     while True:
         volumes = find_volumes()
@@ -1322,20 +1342,12 @@ def watch(delete_after):
         done &= current                       # forget volumes that went away
         retry_at = {k: v for k, v in retry_at.items() if k in current}
 
-        for volume in volumes:
-            name = volume.name
-            if name in done:
+        # Collect finished workers first so their slots free up
+        for name, thread in list(active.items()):
+            if thread.is_alive():
                 continue
-            if time.monotonic() < retry_at.get(name, 0):
-                continue
-
-            time.sleep(SETTLE_DELAY)
-            if not volume.is_dir():
-                continue
-
-            ok = collect(volume, delete_after)
-            phase = read_state(safe_name(name)).get("phase")
-            if ok or phase == "nothing_new":
+            del active[name]
+            if results.pop(name, False):
                 done.add(name)
                 retry_at.pop(name, None)
             else:
@@ -1345,7 +1357,25 @@ def watch(delete_after):
                 retry_at[name] = time.monotonic() + DEVICE_RETRY
                 log(f"volume {name}: will retry in {DEVICE_RETRY:.0f} s")
 
-        time.sleep(POLL_INTERVAL)
+        for volume in volumes:
+            name = volume.name
+            if name in done or name in active:
+                continue
+            if not device_kind(volume):
+                done.add(name)          # not ours; ignore it quietly
+                continue
+            if time.monotonic() < retry_at.get(name, 0):
+                continue
+            if len(active) >= MAX_PARALLEL:
+                break
+
+            # One thread per device: a camera copying 30 GB must not hold
+            # up the bracelet plugged in beside it.
+            thread = threading.Thread(target=worker, args=(volume,), daemon=True)
+            active[name] = thread
+            thread.start()
+
+        time.sleep(POLL_INTERVAL if not active else 1.0)
 
 
 def list_volumes():
@@ -2002,19 +2032,27 @@ def device_status(name, st, docked, summary_last):
                 "decoding": "PROCESSING"}[phase]
         return what + " - DO NOT UNPLUG", "on_yellow", st.get("file") or ""
 
-    if phase == "error" and (docked or (finished is not None and finished < 3600)):
-        return "ERROR", "on_red", st.get("error") or "see log"
-
+    # A finished device is unmounted, so "can be taken" must survive the
+    # volume disappearing - that banner is the whole point of the screen.
     if phase == "done" and finished is not None \
             and finished < READY_SHOW_MINUTES * 60:
         detail = f"{st.get('files', 0)} files, {human(st.get('bytes', 0))}"
         return "DONE - CAN BE TAKEN", "on_green", detail
 
-    if docked and phase == "nothing_new":
-        return "NOTHING NEW - CAN BE TAKEN", "on_green", ""
-
     if docked:
+        if phase == "error":
+            return "ERROR", "on_red", st.get("error") or "see log"
+        if phase == "nothing_new":
+            return "NOTHING NEW - CAN BE TAKEN", "on_green", ""
         return "CONNECTED", "cyan", "waiting"
+
+    # Not in the dock. A past failure is worth reporting to an engineer,
+    # but never as a banner: the device it refers to is not here, and a
+    # worker would read it as a warning about the one in their hand.
+    if phase == "error" and finished is not None and finished < 24 * 3600:
+        return "not connected", "red", \
+            f"last attempt failed {ago(st.get('finished'))}: " \
+            f"{st.get('error') or 'see log'}"
 
     last = st.get("last_done") or summary_last
     idle = seconds_since(last)
@@ -2076,7 +2114,8 @@ def render_dashboard(version, host, summary, pending, width):
         label, colour, detail = device_status(
             name, st, name in docked, d.get("last"))
 
-        if colour in ("on_yellow", "on_green", "on_red"):
+        if colour in ("on_yellow", "on_green", "on_red") \
+                and (name in docked or colour == "on_green"):
             banners.append((name, label, colour))
 
         upload = ""
@@ -2131,6 +2170,35 @@ def render_dashboard(version, host, summary, pending, width):
     if top:
         top.append("")
     return lines[:2] + top + lines[2:]
+
+
+def forget_device(name):
+    """Remove a device the dashboard should stop showing.
+
+    Cards renamed after their first use leave a row behind under the old
+    label. This clears the stale state, and the collected data with it
+    only if that data is empty.
+    """
+    removed = []
+    state_file = state_dir() / f"{safe_name(name)}.json"
+    if state_file.exists():
+        state_file.unlink()
+        removed.append(str(state_file))
+
+    folder = OUT_DIR / safe_name(name)
+    if folder.is_dir():
+        if dir_bytes(folder) == 0:
+            shutil.rmtree(folder, ignore_errors=True)
+            removed.append(str(folder))
+        else:
+            print(f"kept {folder} - it still holds "
+                  f"{human(dir_bytes(folder))} of data")
+
+    if removed:
+        print("removed:\n  " + "\n  ".join(removed))
+    else:
+        print(f"nothing to remove for {name!r}")
+    return 0
 
 
 def dashboard(refresh=1.0):
@@ -2336,6 +2404,8 @@ def main():
                         help="remove the auto-run agent")
     parser.add_argument("--volume", metavar="NAME",
                         help="only use volumes whose name contains this")
+    parser.add_argument("--forget", metavar="DEVICE",
+                        help="stop showing a device that will not come back")
     parser.add_argument("--dashboard", action="store_true",
                         help="full-screen live dashboard")
     parser.add_argument("--upload", action="store_true",
@@ -2389,6 +2459,8 @@ def main():
                     else "verify" if args.verify
                     else "listen" if args.listen else "apply")
             sys.exit(asyncio.run(ble_main(mode)))
+        elif args.forget:
+            sys.exit(forget_device(args.forget))
         elif args.dashboard:
             dashboard()
         elif args.upload:

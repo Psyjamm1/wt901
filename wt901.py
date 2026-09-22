@@ -712,6 +712,28 @@ def video_stamp(path):
     return None
 
 
+def open_session(device_dir):
+    """Folder for this collection, reusing one that was left unfinished.
+
+    Partial .part files live inside the session folder, so a copy that was
+    cut short can only resume if the next attempt lands in the same place.
+    A fresh folder every time would silently restart every transfer.
+    """
+    sessions = device_dir / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = sorted((p for p in sessions.iterdir() if p.is_dir()),
+                          key=lambda p: p.name, reverse=True)
+    except OSError:
+        existing = []
+    for path in existing:
+        if not (path / ".complete").exists() and not (path / ".uploaded").exists():
+            return path
+    path = sessions / datetime.now().strftime("%Y%m%d_%H%M%S")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
     seen = load_state()
     everything = camera_files(volume)
@@ -724,12 +746,14 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
     total = sum(f.stat().st_size for f in fresh)
     log(f"camera {volume.name}: {len(fresh)} new videos, {human(total)}")
 
-    device_dir = OUT_DIR / safe_name(volume.name)
-    session = device_dir / "sessions" / datetime.now().strftime("%Y%m%d_%H%M%S")
-    session.mkdir(parents=True, exist_ok=True)
+    session = open_session(OUT_DIR / safe_name(volume.name))
 
     copied, failed = [], []
+    interrupted = False
     for source in fresh:
+        if not volume.is_dir():
+            interrupted = True
+            break
         target = session / source.name
         ok, size_bytes = False, 0
         for attempt in range(1, COPY_ATTEMPTS + 1):
@@ -743,12 +767,20 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
                 ok = True
                 break
             except OSError as exc:
+                if not volume.is_dir():
+                    # Unplugged mid-copy. Retrying against a path that no
+                    # longer exists only produces confusing errors.
+                    log(f"  {source.name}: device disconnected during copy")
+                    interrupted = True
+                    break
                 log(f"  {source.name}: attempt {attempt} failed - {exc}")
                 # The .part file is deliberately kept: the next attempt,
                 # or the next time the device is plugged in, resumes from it.
                 if attempt < COPY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
 
+        if interrupted:
+            break
         if not ok:
             log(f"  {source.name} skipped, original left on the camera")
             failed.append(source)
@@ -771,6 +803,13 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
             pass
 
     save_state(seen)
+
+    if interrupted:
+        write_state(safe_name(volume.name), phase="interrupted",
+                    finished=now_iso(),
+                    error="unplugged during copy - will resume when reconnected")
+        log("  interrupted; partial file kept, will resume on reconnect")
+        return False
 
     if not copied:
         write_state(safe_name(volume.name), phase="error", finished=now_iso(),
@@ -894,13 +933,15 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
 
     # Each sensor gets its own folder, keyed on the volume label.
     # Rename a card with: diskutil rename "/Volumes/NO NAME" COW01
-    device_dir = OUT_DIR / safe_name(volume.name)
-    session = device_dir / "sessions" / datetime.now().strftime("%Y%m%d_%H%M%S")
-    session.mkdir(parents=True, exist_ok=True)
+    session = open_session(OUT_DIR / safe_name(volume.name))
 
     copied = []
     failed = []
+    interrupted = False
     for source in fresh:
+        if not volume.is_dir():
+            interrupted = True
+            break
         target = session / source.name
         counter = 1
         while target.exists():
@@ -920,12 +961,18 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
                 ok = True
                 break
             except OSError as exc:
+                if not volume.is_dir():
+                    log(f"  {source.name}: device disconnected during copy")
+                    interrupted = True
+                    break
                 log(f"  {source.name}: attempt {attempt} failed - {exc}")
                 # The .part file is deliberately kept: the next attempt,
                 # or the next time the device is plugged in, resumes from it.
                 if attempt < COPY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
 
+        if interrupted:
+            break
         if not ok:
             log(f"  {source.name} skipped, original left on the card")
             failed.append(source)
@@ -936,6 +983,13 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
         log(f"  {source.name}  {size_bytes / (1024 * 1024):.1f} MB  ok")
 
     save_state(seen)
+
+    if interrupted:
+        write_state(safe_name(volume.name), phase="interrupted",
+                    finished=now_iso(),
+                    error="unplugged during copy - will resume when reconnected")
+        log("  interrupted; partial file kept, will resume on reconnect")
+        return False
 
     if not copied:
         log("nothing could be copied")
@@ -2040,6 +2094,8 @@ def device_status(name, st, docked, summary_last):
         return "DONE - CAN BE TAKEN", "on_green", detail
 
     if docked:
+        if phase == "interrupted":
+            return "RESUMING", "on_yellow", "reconnected, picking up where it stopped"
         if phase == "error":
             return "ERROR", "on_red", st.get("error") or "see log"
         if phase == "nothing_new":
@@ -2049,6 +2105,10 @@ def device_status(name, st, docked, summary_last):
     # Not in the dock. A past failure is worth reporting to an engineer,
     # but never as a banner: the device it refers to is not here, and a
     # worker would read it as a warning about the one in their hand.
+    if phase == "interrupted":
+        return "not connected", "yellow", \
+            "copy interrupted - reconnect the device to resume"
+
     if phase == "error" and finished is not None and finished < 24 * 3600:
         return "not connected", "red", \
             f"last attempt failed {ago(st.get('finished'))}: " \

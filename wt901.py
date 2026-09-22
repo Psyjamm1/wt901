@@ -455,6 +455,88 @@ def convert_file(path):
 # Finding volumes and files
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Mounting USB media ourselves (Linux)
+#
+# The desktop only auto-mounts a device when it appears. Once this program
+# unmounts a volume - which is how a worker sees that a device is finished -
+# nothing will ever mount it again while it stays plugged in. So on Linux we
+# mount removable filesystems ourselves through udisksctl, which needs no
+# root, and simply remember the ones we have already finished with.
+# --------------------------------------------------------------------------
+
+MOUNT_RETRY = 30.0
+_mount_attempts = {}
+
+
+def usb_filesystems():
+    """Removable USB filesystems, whether or not they are mounted."""
+    if platform.system() != "Linux":
+        return []
+    try:
+        result = subprocess.run(
+            ["lsblk", "--json", "-o",
+             "PATH,LABEL,FSTYPE,MOUNTPOINT,TRAN,UUID,TYPE"],
+            capture_output=True, text=True, timeout=10)
+        data = json.loads(result.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+    found = []
+
+    def walk(nodes, transport):
+        for node in nodes:
+            carried = node.get("tran") or transport
+            if node.get("fstype") and carried == "usb":
+                found.append({
+                    "path": node.get("path"),
+                    "label": node.get("label") or "",
+                    "uuid": node.get("uuid") or node.get("path"),
+                    "mountpoint": node.get("mountpoint"),
+                })
+            walk(node.get("children") or [], carried)
+
+    walk(data.get("blockdevices", []), None)
+    return found
+
+
+def mount_new_media(skip_uuids):
+    """Mount anything removable that is not mounted and not already done."""
+    for device in usb_filesystems():
+        if device["mountpoint"] or not device["path"]:
+            continue
+        if device["uuid"] in skip_uuids:
+            continue
+
+        moment = time.monotonic()
+        if moment - _mount_attempts.get(device["path"], 0) < MOUNT_RETRY:
+            continue
+        _mount_attempts[device["path"]] = moment
+
+        try:
+            result = subprocess.run(
+                ["udisksctl", "mount", "-b", device["path"],
+                 "--no-user-interaction"],
+                capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log(f"could not mount {device['path']}: {exc}")
+            continue
+
+        name = device["label"] or device["path"]
+        if result.returncode == 0:
+            log(f"mounted {name}")
+        else:
+            message = (result.stderr or result.stdout).strip().splitlines()
+            log(f"could not mount {name}: {message[-1] if message else '?'}")
+
+
+def volume_uuid(volume):
+    for device in usb_filesystems():
+        if device["mountpoint"] == str(volume):
+            return device["uuid"]
+    return None
+
+
 def find_volumes():
     found = []
     roots = [r for r in mount_roots() if r.is_dir()]
@@ -1375,6 +1457,7 @@ def watch(delete_after):
     retry_at = {}       # volumes that failed, and when to try them again
     active = {}         # volumes being collected right now
     results = {}        # what each finished worker reported
+    settled = set()     # uuids we finished with; do not mount them again
 
     def worker(volume):
         name = volume.name
@@ -1383,14 +1466,24 @@ def watch(delete_after):
             if not volume.is_dir():
                 results[name] = False
                 return
+            uuid = volume_uuid(volume)
             ok = collect(volume, delete_after)
             phase = read_state(safe_name(name)).get("phase")
-            results[name] = bool(ok) or phase == "nothing_new"
+            finished = bool(ok) or phase == "nothing_new"
+            if finished and uuid:
+                # We unmounted it on purpose; leave it alone until the
+                # device is physically unplugged and put back.
+                settled.add(uuid)
+            results[name] = finished
         except Exception as exc:
             log(f"volume {name}: collection crashed - {exc}")
             results[name] = False
 
     while True:
+        attached = {d["uuid"] for d in usb_filesystems()}
+        settled &= attached          # forget devices that were taken away
+        mount_new_media(settled)
+
         volumes = find_volumes()
         current = {v.name for v in volumes}
         done &= current                       # forget volumes that went away

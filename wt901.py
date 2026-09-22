@@ -752,10 +752,10 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
     the checksums would differ for no real reason. We hash exactly what
     we read, then compare it against what landed on disk.
     """
-    try:
-        total = source.stat().st_size
-    except OSError:
-        total = 0
+    # Stat the source before touching anything. If the device has gone
+    # away, give up immediately: carrying on would compare the partial
+    # file against a size of zero and throw away a good resume point.
+    total = source.stat().st_size
 
     # Copy into a .part file and rename only once it is verified. A half
     # copied file therefore never looks finished, and an interrupted
@@ -903,6 +903,10 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
                 # or the next time the device is plugged in, resumes from it.
                 if attempt < COPY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
+                if not source.exists() or not volume.is_dir():
+                    log(f"  {source.name}: device disconnected during copy")
+                    interrupted = True
+                    break
 
         if interrupted:
             break
@@ -1013,17 +1017,33 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
     if done_bytes is None:
         done_bytes = [0]
     last_write = [0.0]
+    window = []          # recent (time, bytes) pairs, for a live speed
+    began = time.monotonic()
 
     def tracker(got, file_total, name=""):
         if progress:
             progress(got, file_total, name)
         moment = time.monotonic()
+        overall = done_bytes[0] + got
+        window.append((moment, overall))
+        while len(window) > 2 and moment - window[0][0] > 10:
+            window.pop(0)
+
         if moment - last_write[0] < 0.5:
             return
         last_write[0] = moment
-        overall = done_bytes[0] + got
+
+        # Speed over the last few seconds rather than the whole transfer:
+        # a resumed copy would otherwise look impossibly fast at first.
+        speed = 0.0
+        span = window[-1][0] - window[0][0]
+        if span > 0.5:
+            speed = (window[-1][1] - window[0][1]) / span
+        left = max(0, total - overall)
         percent = int(100 * overall / total) if total else 0
         write_state(dev, phase="copying", file=name, copied=overall,
+                    total=total, speed=speed,
+                    eta=(left / speed) if speed > 1 else None,
                     percent=min(percent, 99))
 
     try:
@@ -1037,7 +1057,9 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
     finally:
         release_lock(lock_name)
 
-    if not ok and read_state(dev).get("phase") in ("checking", "copying", "decoding"):
+    if ok:
+        write_state(dev, took=time.monotonic() - began, speed=None, eta=None)
+    elif read_state(dev).get("phase") in ("checking", "copying", "decoding"):
         write_state(dev, phase="nothing_new", finished=now_iso())
     return ok
 
@@ -1095,6 +1117,10 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
                 # or the next time the device is plugged in, resumes from it.
                 if attempt < COPY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
+                if not source.exists() or not volume.is_dir():
+                    log(f"  {source.name}: device disconnected during copy")
+                    interrupted = True
+                    break
 
         if interrupted:
             break
@@ -1269,7 +1295,11 @@ def upload_session(path, rclone):
         for line in proc.stdout:
             match = re.search(r"(\d+)%", line)
             if match:
-                write_state("uploader", percent=int(match.group(1)))
+                pace = re.search(r"([\d.]+\s*[KMGT]?i?B/s)", line)
+                eta = re.search(r"ETA\s+(\S+)", line)
+                write_state("uploader", percent=int(match.group(1)),
+                            speed=pace.group(1) if pace else None,
+                            eta=eta.group(1) if eta else None)
             if "ERROR" in line:
                 last_error = line.strip()[-200:]
         code = proc.wait()
@@ -2178,6 +2208,16 @@ C = {
 }
 
 
+def short_time(seconds):
+    if seconds is None:
+        return ""
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
 def paint(text, *styles):
     return "".join(C[s] for s in styles) + text + C["reset"]
 
@@ -2223,13 +2263,26 @@ def device_status(name, st, docked, summary_last):
         pct = st.get("percent") or 0
         what = {"checking": "CHECKING", "copying": f"COPYING {pct}%",
                 "decoding": "PROCESSING"}[phase]
-        return what + " - DO NOT UNPLUG", "on_yellow", st.get("file") or ""
+        detail = []
+        if st.get("copied") and st.get("total"):
+            detail.append(f"{human(st['copied'])} of {human(st['total'])}")
+        if st.get("speed"):
+            detail.append(f"{human(st['speed'])}/s")
+        if st.get("eta"):
+            detail.append(f"{short_time(st['eta'])} left")
+        if st.get("file"):
+            detail.append(st["file"])
+        return what + " - DO NOT UNPLUG", "on_yellow", "  ".join(detail)
 
     # A finished device is unmounted, so "can be taken" must survive the
     # volume disappearing - that banner is the whole point of the screen.
     if phase == "done" and finished is not None \
             and finished < READY_SHOW_MINUTES * 60:
         detail = f"{st.get('files', 0)} files, {human(st.get('bytes', 0))}"
+        took = st.get("took")
+        if took and took > 1 and st.get("bytes"):
+            detail += (f" in {short_time(took)} "
+                       f"({human(st['bytes'] / took)}/s)")
         return "DONE - CAN BE TAKEN", "on_green", detail
 
     if docked:
@@ -2339,8 +2392,13 @@ def render_dashboard(version, host, summary, pending, width):
         waiting = len(pending)
         wbytes = human(sum(dir_bytes(p) for p in pending))
         if phase == "uploading" and (seconds_since(up.get("updated")) or 0) < 300:
-            state = paint(f"uploading {up.get('session')}  {up.get('percent', 0)}%",
-                          "yellow", "bold")
+            extra = ""
+            if up.get("speed"):
+                extra += f"  {up['speed']}"
+            if up.get("eta"):
+                extra += f"  ETA {up['eta']}"
+            state = paint(f"uploading {up.get('session')}  "
+                          f"{up.get('percent', 0)}%{extra}", "yellow", "bold")
         elif phase == "error":
             state = paint(f"ERROR: {up.get('error')}", "red", "bold") + \
                 paint(f"  (retrying every {UPLOAD_INTERVAL:.0f} s)", "dim")

@@ -1011,8 +1011,11 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
     except OSError:
         total = 0
 
+    # Clear the figures from the previous run, or "checking" would still
+    # show the bytes and speed of a transfer that is already over.
     write_state(dev, phase="checking", kind=kind, started=now_iso(),
-                volume=str(volume), total=total, percent=0, file=None, error=None)
+                volume=str(volume), total=total, percent=0, copied=0,
+                speed=None, eta=None, took=None, file=None, error=None)
 
     if done_bytes is None:
         done_bytes = [0]

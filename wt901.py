@@ -661,6 +661,48 @@ class Busy(Exception):
     """Another instance is already working on this volume."""
 
 
+def holder_alive(text):
+    """Is the process that wrote this lock still running?
+
+    A lock left behind by a killed collector - a service restart during a
+    copy, say - would otherwise block the device until it went stale.
+    """
+    match = re.search(r"pid (\d+)", text or "")
+    if not match:
+        return True
+    try:
+        os.kill(int(match.group(1)), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def clear_stuck_state():
+    """Reset devices left mid-copy by a collector that is no longer running."""
+    folder = state_dir()
+    if not folder.is_dir():
+        return
+    for path in sorted(folder.glob("*.json")):
+        if path.stem == "uploader":
+            continue
+        if read_state(path.stem).get("phase") in ("checking", "copying",
+                                                  "decoding"):
+            write_state(path.stem, phase="interrupted", finished=now_iso(),
+                        error="collector stopped mid-copy - "
+                              "reconnect the device to resume")
+            log(f"{path.stem}: was left mid-copy, marked for resume")
+
+    for lock in sorted(OUT_DIR.glob("collector*.lock")):
+        try:
+            if not holder_alive(lock.read_text()):
+                lock.unlink()
+                log(f"removed stale lock {lock.name}")
+        except OSError:
+            pass
+
+
 def acquire_lock(stale_after=900, name="collector"):
     """Take an exclusive lock, or raise Busy.
 
@@ -674,10 +716,11 @@ def acquire_lock(stale_after=900, name="collector"):
 
     if path.exists():
         try:
+            text = path.read_text().strip()
             age = time.time() - path.stat().st_mtime
-            if age < stale_after:
-                raise Busy(path.read_text().strip() or "another instance")
-            path.unlink()
+            if age < stale_after and holder_alive(text):
+                raise Busy(text or "another instance")
+            path.unlink()          # dead owner, or long forgotten
         except OSError:
             pass
 
@@ -1309,6 +1352,7 @@ def uploader_loop():
 
 def run_once(delete_after):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    clear_stuck_state()
     time.sleep(SETTLE_DELAY)
     volumes = find_volumes()
     if not volumes:
@@ -1367,6 +1411,7 @@ def monitor(delete_after):
     """Watch the dock and show what is happening in the terminal."""
     globals()["QUIET"] = True      # keep the log from breaking the live view
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    clear_stuck_state()
     screen = Screen()
 
     print()
@@ -1452,6 +1497,7 @@ def watch(delete_after):
     if UPLOAD_REMOTE:
         log(f"uploading to {UPLOAD_REMOTE} every {UPLOAD_INTERVAL:.0f} s")
         threading.Thread(target=uploader_loop, daemon=True).start()
+    clear_stuck_state()
 
     done = set()        # finished while this volume stayed mounted
     retry_at = {}       # volumes that failed, and when to try them again

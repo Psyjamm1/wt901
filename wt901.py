@@ -184,6 +184,10 @@ def save_state(seen):
 # Live state shared with the dashboard
 # --------------------------------------------------------------------------
 
+# State files that describe background jobs, not physical devices
+SERVICE_STATES = {"uploader", "transcoder"}
+
+
 def state_dir():
     return OUT_DIR / "state"
 
@@ -696,7 +700,7 @@ def clear_stuck_state():
     if not folder.is_dir():
         return
     for path in sorted(folder.glob("*.json")):
-        if path.stem == "uploader":
+        if path.stem in SERVICE_STATES:
             continue
         if read_state(path.stem).get("phase") in ("checking", "copying",
                                                   "decoding"):
@@ -1497,12 +1501,38 @@ def video_meta(path):
     return path.with_suffix(".meta.json")
 
 
+TRANSCODE_GIVE_UP = 3
+
+
 def needs_transcode(path):
     try:
         meta = json.loads(video_meta(path).read_text())
-        return not meta.get("transcoded")
     except (OSError, ValueError):
         return True          # no record of it having been processed
+    if meta.get("transcoded"):
+        return False
+    # A file ffmpeg cannot read must not be retried forever - it would
+    # block every other video behind it.
+    return meta.get("transcode_failures", 0) < TRANSCODE_GIVE_UP
+
+
+def note_transcode_failure(path, reason):
+    record = {}
+    try:
+        record = json.loads(video_meta(path).read_text())
+    except (OSError, ValueError):
+        pass
+    count = record.get("transcode_failures", 0) + 1
+    record.update({"file": path.name, "kind": "video",
+                   "transcode_failures": count,
+                   "transcode_error": reason[:300]})
+    try:
+        video_meta(path).write_text(json.dumps(record, indent=1))
+    except OSError:
+        pass
+    if count >= TRANSCODE_GIVE_UP:
+        log(f"  giving up on {path.name} after {count} attempts; "
+            f"it stays at full size")
 
 
 def pending_videos():
@@ -1527,11 +1557,15 @@ def transcode_file(path, use_vaapi):
     log(f"re-encode {label} ({human(before)})")
 
     started = time.monotonic()
+    complaints = []
     try:
+        # One pipe for both streams: reading them separately risks blocking
+        # when ffmpeg fills the one we are not reading.
         proc = subprocess.Popen(encode_command(path, target, use_vaapi),
                                 stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
+                                stderr=subprocess.STDOUT, text=True)
         for line in proc.stdout:
+            line = line.rstrip()
             if line.startswith("out_time_us=") and duration:
                 try:
                     seconds = int(line.split("=", 1)[1]) / 1_000_000
@@ -1539,16 +1573,20 @@ def transcode_file(path, use_vaapi):
                     continue
                 write_state("transcoder",
                             percent=min(99, int(100 * seconds / duration)))
+            elif line and "=" not in line.split(" ")[0]:
+                complaints.append(line)
+                del complaints[:-6]
         code = proc.wait()
-        problem = (proc.stderr.read() or "").strip()[-200:]
+        problem = " | ".join(complaints)[-300:]
     except (OSError, subprocess.SubprocessError) as exc:
         code, problem = -1, str(exc)
 
     if code != 0 or not target.exists():
-        write_state("transcoder", phase="error",
-                    error=problem or f"ffmpeg exited with code {code}")
-        log(f"  re-encode failed: {problem or code}")
+        reason = problem or f"ffmpeg exited with code {code}"
+        write_state("transcoder", phase="error", error=reason)
+        log(f"  re-encode failed: {reason}")
         target.unlink(missing_ok=True)
+        note_transcode_failure(path, reason)
         return False
 
     # A truncated output would silently lose footage, so check the length
@@ -1558,6 +1596,7 @@ def transcode_file(path, use_vaapi):
         write_state("transcoder", phase="error", error=message)
         log(f"  re-encode rejected, {message}")
         target.unlink(missing_ok=True)
+        note_transcode_failure(path, message)
         return False
 
     after = target.stat().st_size
@@ -1608,15 +1647,17 @@ def transcode_pass():
         return
     try:
         use_vaapi = vaapi_available()
+        failures = 0
         for index, path in enumerate(pending):
             if not path.exists():
                 continue
             if not transcode_file(path, use_vaapi):
-                return
+                failures += 1      # move on; the rest must not wait for it
             rest = [p for p in pending[index + 1:] if p.exists()]
             write_state("transcoder", pending=len(rest),
                         pending_bytes=sum(p.stat().st_size for p in rest))
-        write_state("transcoder", phase="idle", error=None)
+        if not failures:
+            write_state("transcoder", phase="idle", error=None)
     finally:
         release_lock("transcoder")
 
@@ -2610,7 +2651,7 @@ def render_dashboard(version, host, summary, pending, width):
     states = {}
     if state_dir().is_dir():
         for path in state_dir().glob("*.json"):
-            if path.stem != "uploader":
+            if path.stem not in SERVICE_STATES:
                 states[path.stem] = read_state(path.stem)
 
     pending_by_dev = {}
@@ -2687,7 +2728,8 @@ def render_dashboard(version, host, summary, pending, width):
             state = paint(f"re-encoding {enc.get('file')}  "
                           f"{enc.get('percent', 0)}%", "yellow", "bold")
         elif phase == "error":
-            state = paint(f"ERROR: {enc.get('error')}", "red", "bold")
+            brief = " ".join((enc.get("error") or "").split())[:90]
+            state = paint(f"ERROR: {brief}", "red", "bold")
         elif waiting:
             state = paint(f"{waiting} videos waiting", "yellow")
         else:

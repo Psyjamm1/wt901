@@ -75,6 +75,8 @@ TRANSCODE_CRF = 28         # lower means better quality and bigger files
 TRANSCODE_PRESET = "veryfast"
 TRANSCODE_KEEP_ORIGINAL = False
 TRANSCODE_HW = "auto"      # auto, vaapi or none
+TRANSCODE_THREADS = 0      # 0 lets ffmpeg decide
+TRANSCODE_NICE = 10        # keep encoding from starving the copying
 TRANSCODE_INTERVAL = 20.0
 
 READY_SHOW_MINUTES = 30   # how long the dashboard keeps saying "can be taken"
@@ -759,6 +761,35 @@ def release_lock(name="collector"):
 # Main workflow
 # --------------------------------------------------------------------------
 
+RESUME_REWIND = 8 * 1024 * 1024      # bytes dropped from a partial file
+
+
+def verified_prefix(source, part, length, hasher, chunk):
+    """Does the first `length` bytes of `part` really match `source`?
+
+    Only the last stretch is compared byte for byte: writes are sequential,
+    so damage lands at the end, and comparing the whole prefix would mean
+    re-reading it from the device and losing the point of resuming.
+    """
+    compare_from = max(0, length - RESUME_REWIND)
+    try:
+        with open(part, "rb") as existing, open(source, "rb") as original:
+            position = 0
+            while position < length:
+                block = existing.read(min(chunk, length - position))
+                if not block:
+                    return False
+                hasher.update(block)
+                if position + len(block) > compare_from:
+                    original.seek(position)
+                    if original.read(len(block)) != block:
+                        return False
+                position += len(block)
+    except OSError:
+        return False
+    return True
+
+
 def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
     """Copy in a single pass, hashing the bytes as they are read.
 
@@ -780,17 +811,20 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
     source_hash = hashlib.sha256()
     if part.exists():
         done = part.stat().st_size
-        if 0 < done <= total:
-            with open(part, "rb") as existing:
-                while True:
-                    block = existing.read(chunk)
-                    if not block:
-                        break
-                    source_hash.update(block)
+        # Drop the tail before resuming. An interrupted write can leave
+        # buffered bytes missing or partly written, and hashing our own
+        # output against itself would never notice: both sides would be
+        # computed from the same damaged bytes.
+        done = max(0, min(done, total) - RESUME_REWIND)
+        if done > 0 and verified_prefix(source, part, done, source_hash, chunk):
             resume_from = done
         else:
+            source_hash = hashlib.sha256()
             part.unlink()
 
+    if resume_from:
+        with open(part, "r+b") as existing:
+            existing.truncate(resume_from)
     copied_bytes = resume_from
     mode = "ab" if resume_from else "wb"
     with open(source, "rb") as src, open(part, mode) as dst:
@@ -1454,8 +1488,13 @@ def video_duration(path):
         return None
 
 
+# Set once the GPU has proved unreliable on this footage, so we stop
+# wasting a failed attempt on every single file.
+_VAAPI_BROKEN = False
+
+
 def vaapi_available():
-    if TRANSCODE_HW == "none":
+    if TRANSCODE_HW == "none" or _VAAPI_BROKEN:
         return False
     if not Path("/dev/dri/renderD128").exists():
         return False
@@ -1485,7 +1524,7 @@ def encode_command(source, target, use_vaapi):
             "-movflags", "+faststart",
             "-progress", "pipe:1", "-nostats", str(target),
         ]
-    return [
+    command = [
         ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(source),
         "-vf", f"scale=-2:{TRANSCODE_HEIGHT}",
@@ -1495,6 +1534,12 @@ def encode_command(source, target, use_vaapi):
         "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats", str(target),
     ]
+    if TRANSCODE_THREADS:
+        command[3:3] = ["-threads", str(TRANSCODE_THREADS)]
+    # Encoding is never urgent; copying from a camera is.
+    if TRANSCODE_NICE and shutil.which("nice"):
+        command = ["nice", "-n", str(TRANSCODE_NICE)] + command
+    return command
 
 
 def video_meta(path):
@@ -1553,8 +1598,10 @@ def transcode_file(path, use_vaapi):
     label = f"{path.parent.parent.parent.name}/{path.name}"
 
     write_state("transcoder", phase="working", file=label, percent=0,
-                bytes=before, started=now_iso(), error=None)
-    log(f"re-encode {label} ({human(before)})")
+                bytes=before, started=now_iso(), error=None,
+                encoder="gpu" if use_vaapi else "cpu")
+    log(f"re-encode {label} ({human(before)}, "
+        f"{'hardware' if use_vaapi else 'software'})")
 
     started = time.monotonic()
     complaints = []
@@ -1583,9 +1630,16 @@ def transcode_file(path, use_vaapi):
 
     if code != 0 or not target.exists():
         reason = problem or f"ffmpeg exited with code {code}"
+        target.unlink(missing_ok=True)
+        if use_vaapi:
+            # The GPU chokes on some codecs - 10-bit H.265 in particular.
+            # Software encoding is slower but handles everything.
+            globals()["_VAAPI_BROKEN"] = True
+            log(f"  hardware encoding failed ({reason[:80]}); "
+                f"switching to software for the rest of this run")
+            return transcode_file(path, False)
         write_state("transcoder", phase="error", error=reason)
         log(f"  re-encode failed: {reason}")
-        target.unlink(missing_ok=True)
         note_transcode_failure(path, reason)
         return False
 
@@ -1593,9 +1647,14 @@ def transcode_file(path, use_vaapi):
     made = video_duration(target)
     if duration and made and abs(made - duration) > max(2.0, duration * 0.02):
         message = f"length changed: {duration:.0f}s -> {made:.0f}s"
+        target.unlink(missing_ok=True)
+        if use_vaapi:
+            globals()["_VAAPI_BROKEN"] = True
+            log(f"  hardware encoding produced a short file; "
+                f"switching to software")
+            return transcode_file(path, False)
         write_state("transcoder", phase="error", error=message)
         log(f"  re-encode rejected, {message}")
-        target.unlink(missing_ok=True)
         note_transcode_failure(path, message)
         return False
 
@@ -1625,6 +1684,84 @@ def transcode_file(path, use_vaapi):
     write_state("transcoder", last_ok=now_iso(), percent=100,
                 saved=read_state("transcoder").get("saved", 0) + before - after)
     return True
+
+
+def benchmark(path, seconds=60, heights=None):
+    """Time a few encoder settings on real footage from this camera.
+
+    Guessing at presets is pointless: the answer depends on the machine
+    and on what the camera actually records.
+    """
+    path = Path(path)
+    if not path.exists():
+        print(f"no such file: {path}")
+        return 1
+    if not ffmpeg_bin():
+        print("ffmpeg is not installed")
+        return 1
+
+    duration = video_duration(path)
+    size = path.stat().st_size
+    if not duration:
+        print("cannot read that file")
+        return 1
+
+    rate = size / duration                      # bytes per second of footage
+    sample = min(seconds, duration)
+    print(f"\nsource   {path.name}")
+    print(f"         {human(size)}, {short_time(duration)}, "
+          f"{human(rate)}/s of footage")
+    print(f"sample   {sample:.0f} s from the middle\n")
+
+    start = max(0, duration / 2 - sample / 2)
+    heights = heights or [TRANSCODE_HEIGHT]
+    combos = [(h, p, c) for h in heights
+              for p, c in (("ultrafast", TRANSCODE_CRF),
+                           ("veryfast", TRANSCODE_CRF),
+                           ("faster", TRANSCODE_CRF),
+                           ("veryfast", TRANSCODE_CRF - 4),
+                           ("veryfast", TRANSCODE_CRF + 4))]
+
+    print(f"  {'height':>6} {'preset':<10} {'crf':>4} {'time':>7} "
+          f"{'size/min':>9} {'smaller':>8} {'speed':>7}  hours per 8 h shift")
+    print("  " + "-" * 78)
+
+    temp = Path("/tmp") / f"wt901-bench-{os.getpid()}.mp4"
+    for height, preset, crf in combos:
+        command = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+                   "-ss", f"{start:.2f}", "-t", f"{sample:.2f}",
+                   "-i", str(path), "-vf", f"scale=-2:{height}",
+                   "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+                   "-c:a", "aac", "-b:a", "64k", str(temp)]
+        if TRANSCODE_THREADS:
+            command[3:3] = ["-threads", str(TRANSCODE_THREADS)]
+        began = time.monotonic()
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=1800)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"  {height:>6} {preset:<10} {crf:>4}   failed: {exc}")
+            continue
+        took = time.monotonic() - began
+        if result.returncode != 0 or not temp.exists():
+            note = " ".join((result.stderr or "").split())[:50]
+            print(f"  {height:>6} {preset:<10} {crf:>4}   failed: {note}")
+            continue
+
+        out = temp.stat().st_size
+        per_minute = out / sample * 60
+        smaller = (rate * sample) / max(out, 1)
+        speed = sample / took                   # times faster than realtime
+        shift_hours = 8 / speed
+        print(f"  {height:>6} {preset:<10} {crf:>4} {took:>6.1f}s "
+              f"{human(per_minute):>9} {smaller:>7.0f}x {speed:>6.1f}x "
+              f"  {shift_hours:>5.1f} h")
+        temp.unlink(missing_ok=True)
+
+    print("\n  speed is relative to real time: 4x means an hour of footage")
+    print("  takes 15 minutes. The last column is how long one 8 hour shift")
+    print("  of continuous recording would take to re-encode.\n")
+    return 0
 
 
 def transcode_pass():
@@ -3002,6 +3139,10 @@ def main():
                         help="only use volumes whose name contains this")
     parser.add_argument("--forget", metavar="DEVICE",
                         help="stop showing a device that will not come back")
+    parser.add_argument("--benchmark", metavar="VIDEO",
+                        help="time encoder settings on one of your own files")
+    parser.add_argument("--seconds", type=int, default=60, metavar="N",
+                        help="length of the sample for --benchmark")
     parser.add_argument("--transcode", action="store_true",
                         help="re-encode video to a much smaller file")
     parser.add_argument("--height", type=int, metavar="PIXELS",
@@ -3072,6 +3213,9 @@ def main():
                     else "verify" if args.verify
                     else "listen" if args.listen else "apply")
             sys.exit(asyncio.run(ble_main(mode)))
+        elif args.benchmark:
+            sys.exit(benchmark(args.benchmark, args.seconds,
+                               [args.height] if args.height else None))
         elif args.forget:
             sys.exit(forget_device(args.forget))
         elif args.dashboard:

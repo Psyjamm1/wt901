@@ -1597,13 +1597,13 @@ def transcode_file(path, use_vaapi):
     target = path.with_name(path.stem + ".encoding.mp4")
     label = f"{path.parent.parent.parent.name}/{path.name}"
 
+    started = time.monotonic()
     write_state("transcoder", phase="working", file=label, percent=0,
-                bytes=before, started=now_iso(), error=None,
+                bytes=before, started=now_iso(), error=None, eta=None, pace=None,
                 encoder="gpu" if use_vaapi else "cpu")
     log(f"re-encode {label} ({human(before)}, "
         f"{'hardware' if use_vaapi else 'software'})")
 
-    started = time.monotonic()
     complaints = []
     try:
         # One pipe for both streams: reading them separately risks blocking
@@ -1618,8 +1618,13 @@ def transcode_file(path, use_vaapi):
                     seconds = int(line.split("=", 1)[1]) / 1_000_000
                 except ValueError:
                     continue
+                elapsed = time.monotonic() - started
+                pace = seconds / elapsed if elapsed > 1 else 0
                 write_state("transcoder",
-                            percent=min(99, int(100 * seconds / duration)))
+                            percent=min(99, int(100 * seconds / duration)),
+                            pace=round(pace, 2),
+                            eta=((duration - seconds) / pace) if pace else None,
+                            of=duration)
             elif line and "=" not in line.split(" ")[0]:
                 complaints.append(line)
                 del complaints[:-6]
@@ -2856,14 +2861,19 @@ def render_dashboard(version, host, summary, pending, width):
     lines.append("")
 
     # Re-encoding
-    if TRANSCODE:
-        enc = read_state("transcoder")
+    enc = read_state("transcoder")
+    if TRANSCODE or enc:
         head = paint("PROCESSING", "blue", "bold")
         phase = enc.get("phase")
         waiting = enc.get("pending", 0)
         if phase == "working" and (seconds_since(enc.get("updated")) or 0) < 600:
+            extra = ""
+            if enc.get("pace"):
+                extra += f"  {enc['pace']:.1f}x real time"
+            if enc.get("eta"):
+                extra += f"  {short_time(enc['eta'])} left"
             state = paint(f"re-encoding {enc.get('file')}  "
-                          f"{enc.get('percent', 0)}%", "yellow", "bold")
+                          f"{enc.get('percent', 0)}%{extra}", "yellow", "bold")
         elif phase == "error":
             brief = " ".join((enc.get("error") or "").split())[:90]
             state = paint(f"ERROR: {brief}", "red", "bold")
@@ -2873,7 +2883,8 @@ def render_dashboard(version, host, summary, pending, width):
             state = paint("idle, nothing to re-encode", "green")
         lines.append(f"{head}  {state}")
         saved = enc.get("saved", 0)
-        lines.append(f"  target {TRANSCODE_HEIGHT}p   "
+        where = "GPU" if enc.get("encoder") == "gpu" else "CPU"
+        lines.append(f"  {TRANSCODE_HEIGHT}p on {where}   "
                      f"waiting {waiting} ({human(enc.get('pending_bytes', 0))})"
                      + (f"   space reclaimed {human(saved)}" if saved else ""))
         lines.append("")

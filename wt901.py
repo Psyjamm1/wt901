@@ -66,6 +66,17 @@ DELETE_AFTER_UPLOAD = False   # free local disk once a session is verified remot
 
 DEVICE_RETRY = 60.0       # seconds before retrying a device that failed
 MAX_PARALLEL = 4          # devices collected at the same time
+# Re-encode video after it has been copied. The camera records at around
+# 100 Mbit/s, which is far more than watching hand movements needs; 720p at
+# a sane bitrate is roughly thirty times smaller.
+TRANSCODE = False          # turn on with --transcode
+TRANSCODE_HEIGHT = 720     # output height; width follows the aspect ratio
+TRANSCODE_CRF = 28         # lower means better quality and bigger files
+TRANSCODE_PRESET = "veryfast"
+TRANSCODE_KEEP_ORIGINAL = False
+TRANSCODE_HW = "auto"      # auto, vaapi or none
+TRANSCODE_INTERVAL = 20.0
+
 READY_SHOW_MINUTES = 30   # how long the dashboard keeps saying "can be taken"
 STALE_HOURS = 36          # flag a device that has not synced for this long
 SETTLE_DELAY = 3.0        # settle time after a volume mounts
@@ -1292,9 +1303,23 @@ def dir_bytes(path):
     return total
 
 
+def ready_to_upload(path):
+    """Finished collecting, and finished shrinking if we are shrinking."""
+    if not session_complete(path):
+        return False
+    if TRANSCODE:
+        try:
+            if any(needs_transcode(p) for p in path.iterdir()
+                   if p.suffix.upper() in CAMERA_VIDEO_EXTS):
+                return False     # do not send footage we are about to shrink
+        except OSError:
+            return False
+    return True
+
+
 def pending_sessions():
     return sorted((p for p in session_dirs()
-                   if not (p / ".uploaded").exists() and session_complete(p)),
+                   if not (p / ".uploaded").exists() and ready_to_upload(p)),
                   key=lambda p: p.name)
 
 
@@ -1403,6 +1428,209 @@ def upload_pass():
         release_lock("uploader")
 
 
+# --------------------------------------------------------------------------
+# Re-encoding video (ffmpeg)
+# --------------------------------------------------------------------------
+
+def ffmpeg_bin():
+    return shutil.which("ffmpeg")
+
+
+def video_duration(path):
+    probe = shutil.which("ffprobe")
+    if not probe:
+        return None
+    try:
+        result = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=60)
+        return float(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def vaapi_available():
+    if TRANSCODE_HW == "none":
+        return False
+    if not Path("/dev/dri/renderD128").exists():
+        return False
+    try:
+        result = subprocess.run([ffmpeg_bin(), "-hide_banner", "-encoders"],
+                                capture_output=True, text=True, timeout=30)
+        return "h264_vaapi" in result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def encode_command(source, target, use_vaapi):
+    """Software encoding is the default: predictable size, works anywhere.
+
+    The laptop's integrated GPU is many times faster, so it is used when
+    available - a day of footage would otherwise take a day to re-encode.
+    """
+    if use_vaapi:
+        return [
+            ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+            "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
+            "-vaapi_device", "/dev/dri/renderD128",
+            "-i", str(source),
+            "-vf", f"scale_vaapi=w=-2:h={TRANSCODE_HEIGHT}",
+            "-c:v", "h264_vaapi", "-qp", str(TRANSCODE_CRF),
+            "-c:a", "aac", "-b:a", "64k",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", str(target),
+        ]
+    return [
+        ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-vf", f"scale=-2:{TRANSCODE_HEIGHT}",
+        "-c:v", "libx264", "-preset", TRANSCODE_PRESET,
+        "-crf", str(TRANSCODE_CRF),
+        "-c:a", "aac", "-b:a", "64k",
+        "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats", str(target),
+    ]
+
+
+def video_meta(path):
+    return path.with_suffix(".meta.json")
+
+
+def needs_transcode(path):
+    try:
+        meta = json.loads(video_meta(path).read_text())
+        return not meta.get("transcoded")
+    except (OSError, ValueError):
+        return True          # no record of it having been processed
+
+
+def pending_videos():
+    found = []
+    for session in session_dirs():
+        if not session_complete(session):
+            continue
+        for path in sorted(session.iterdir()):
+            if path.suffix.upper() in CAMERA_VIDEO_EXTS and needs_transcode(path):
+                found.append(path)
+    return found
+
+
+def transcode_file(path, use_vaapi):
+    before = path.stat().st_size
+    duration = video_duration(path)
+    target = path.with_name(path.stem + ".encoding.mp4")
+    label = f"{path.parent.parent.parent.name}/{path.name}"
+
+    write_state("transcoder", phase="working", file=label, percent=0,
+                bytes=before, started=now_iso(), error=None)
+    log(f"re-encode {label} ({human(before)})")
+
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(encode_command(path, target, use_vaapi),
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        for line in proc.stdout:
+            if line.startswith("out_time_us=") and duration:
+                try:
+                    seconds = int(line.split("=", 1)[1]) / 1_000_000
+                except ValueError:
+                    continue
+                write_state("transcoder",
+                            percent=min(99, int(100 * seconds / duration)))
+        code = proc.wait()
+        problem = (proc.stderr.read() or "").strip()[-200:]
+    except (OSError, subprocess.SubprocessError) as exc:
+        code, problem = -1, str(exc)
+
+    if code != 0 or not target.exists():
+        write_state("transcoder", phase="error",
+                    error=problem or f"ffmpeg exited with code {code}")
+        log(f"  re-encode failed: {problem or code}")
+        target.unlink(missing_ok=True)
+        return False
+
+    # A truncated output would silently lose footage, so check the length
+    made = video_duration(target)
+    if duration and made and abs(made - duration) > max(2.0, duration * 0.02):
+        message = f"length changed: {duration:.0f}s -> {made:.0f}s"
+        write_state("transcoder", phase="error", error=message)
+        log(f"  re-encode rejected, {message}")
+        target.unlink(missing_ok=True)
+        return False
+
+    after = target.stat().st_size
+    if TRANSCODE_KEEP_ORIGINAL:
+        keep = path.with_name(path.stem + ".original" + path.suffix)
+        path.replace(keep)
+    final = path.with_suffix(".MP4")
+    target.replace(final)
+
+    record = {}
+    try:
+        record = json.loads(video_meta(final).read_text())
+    except (OSError, ValueError):
+        pass
+    record.update({"file": final.name, "kind": "video", "transcoded": True,
+                   "bytes": after, "original_bytes": before,
+                   "seconds": round(duration or 0, 1)})
+    try:
+        video_meta(final).write_text(json.dumps(record, indent=1))
+    except OSError:
+        pass
+
+    took = time.monotonic() - started
+    log(f"  {human(before)} -> {human(after)} "
+        f"({before / max(after, 1):.0f}x smaller, {short_time(took)})")
+    write_state("transcoder", last_ok=now_iso(), percent=100,
+                saved=read_state("transcoder").get("saved", 0) + before - after)
+    return True
+
+
+def transcode_pass():
+    if not TRANSCODE:
+        return
+    pending = pending_videos()
+    write_state("transcoder", pending=len(pending),
+                pending_bytes=sum(p.stat().st_size for p in pending
+                                  if p.exists()))
+    if not ffmpeg_bin():
+        write_state("transcoder", phase="error", error="ffmpeg is not installed")
+        return
+    if not pending:
+        write_state("transcoder", phase="idle", error=None)
+        return
+
+    try:
+        acquire_lock(stale_after=6 * 3600, name="transcoder")
+    except Busy:
+        return
+    try:
+        use_vaapi = vaapi_available()
+        for index, path in enumerate(pending):
+            if not path.exists():
+                continue
+            if not transcode_file(path, use_vaapi):
+                return
+            rest = [p for p in pending[index + 1:] if p.exists()]
+            write_state("transcoder", pending=len(rest),
+                        pending_bytes=sum(p.stat().st_size for p in rest))
+        write_state("transcoder", phase="idle", error=None)
+    finally:
+        release_lock("transcoder")
+
+
+def transcoder_loop():
+    while True:
+        try:
+            transcode_pass()
+        except Exception as exc:
+            log(f"transcoder error: {exc}")
+            write_state("transcoder", phase="error", error=str(exc)[:200])
+        time.sleep(TRANSCODE_INTERVAL)
+
+
 def uploader_loop():
     while True:
         try:
@@ -1430,6 +1658,7 @@ def run_once(delete_after):
     if not worked:
         names = ", ".join(v.name for v in volumes)
         log(f"triggered on connect: no new recordings on ({names})")
+    transcode_pass()
     upload_pass()
     return 0
 
@@ -1560,6 +1789,9 @@ def watch(delete_after):
     if UPLOAD_REMOTE:
         log(f"uploading to {UPLOAD_REMOTE} every {UPLOAD_INTERVAL:.0f} s")
         threading.Thread(target=uploader_loop, daemon=True).start()
+    if TRANSCODE:
+        log(f"re-encoding video to {TRANSCODE_HEIGHT}p in the background")
+        threading.Thread(target=transcoder_loop, daemon=True).start()
     clear_stuck_state()
 
     done = set()        # finished while this volume stayed mounted
@@ -2445,6 +2677,28 @@ def render_dashboard(version, host, summary, pending, width):
                      f"last success {ago(up.get('last_ok'))}")
     lines.append("")
 
+    # Re-encoding
+    if TRANSCODE:
+        enc = read_state("transcoder")
+        head = paint("PROCESSING", "blue", "bold")
+        phase = enc.get("phase")
+        waiting = enc.get("pending", 0)
+        if phase == "working" and (seconds_since(enc.get("updated")) or 0) < 600:
+            state = paint(f"re-encoding {enc.get('file')}  "
+                          f"{enc.get('percent', 0)}%", "yellow", "bold")
+        elif phase == "error":
+            state = paint(f"ERROR: {enc.get('error')}", "red", "bold")
+        elif waiting:
+            state = paint(f"{waiting} videos waiting", "yellow")
+        else:
+            state = paint("idle, nothing to re-encode", "green")
+        lines.append(f"{head}  {state}")
+        saved = enc.get("saved", 0)
+        lines.append(f"  target {TRANSCODE_HEIGHT}p   "
+                     f"waiting {waiting} ({human(enc.get('pending_bytes', 0))})"
+                     + (f"   space reclaimed {human(saved)}" if saved else ""))
+        lines.append("")
+
     # Recent events
     lines.append(paint("RECENT", "blue", "bold"))
     for entry in tail_log(8):
@@ -2538,6 +2792,9 @@ def install(delete_after):
             args.append("--delete")
         if UPLOAD_REMOTE:
             args += ["--remote", UPLOAD_REMOTE]
+        if TRANSCODE:
+            args += ["--transcode", "--height", str(TRANSCODE_HEIGHT),
+                     "--crf", str(TRANSCODE_CRF)]
         entries = "".join(f"\n        <string>{a}</string>" for a in args)
 
         plist = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -2590,6 +2847,11 @@ def install(delete_after):
             args += " --delete"
         if UPLOAD_REMOTE:
             args += f" --remote {UPLOAD_REMOTE}"
+        if TRANSCODE:
+            args += (f" --transcode --height {TRANSCODE_HEIGHT}"
+                     f" --crf {TRANSCODE_CRF}")
+            if TRANSCODE_KEEP_ORIGINAL:
+                args += " --keep-original"
         unit_dir = Path.home() / ".config" / "systemd" / "user"
         unit_dir.mkdir(parents=True, exist_ok=True)
         unit = unit_dir / "wt901.service"
@@ -2618,6 +2880,8 @@ WantedBy=default.target
         autostart = Path.home() / ".config" / "autostart"
         autostart.mkdir(parents=True, exist_ok=True)
         remote_arg = f" --remote {UPLOAD_REMOTE}" if UPLOAD_REMOTE else ""
+        if TRANSCODE:
+            remote_arg += " --transcode"
         (autostart / "wt901-dashboard.desktop").write_text(f"""[Desktop Entry]
 Type=Application
 Name=WT901 dashboard
@@ -2696,6 +2960,14 @@ def main():
                         help="only use volumes whose name contains this")
     parser.add_argument("--forget", metavar="DEVICE",
                         help="stop showing a device that will not come back")
+    parser.add_argument("--transcode", action="store_true",
+                        help="re-encode video to a much smaller file")
+    parser.add_argument("--height", type=int, metavar="PIXELS",
+                        help="output height for --transcode (default 720)")
+    parser.add_argument("--crf", type=int, metavar="N",
+                        help="quality for --transcode, lower is better (default 28)")
+    parser.add_argument("--keep-original", action="store_true",
+                        help="keep the camera original beside the small copy")
     parser.add_argument("--dashboard", action="store_true",
                         help="full-screen live dashboard")
     parser.add_argument("--upload", action="store_true",
@@ -2733,6 +3005,15 @@ def main():
 
     if args.remote:
         globals()["UPLOAD_REMOTE"] = args.remote
+
+    if args.transcode:
+        globals()["TRANSCODE"] = True
+    if args.height:
+        globals()["TRANSCODE_HEIGHT"] = args.height
+    if args.crf:
+        globals()["TRANSCODE_CRF"] = args.crf
+    if args.keep_original:
+        globals()["TRANSCODE_KEEP_ORIGINAL"] = True
 
     if args.rate:
         codes = {20: (0x07, 0x05), 50: (0x08, 0x04),

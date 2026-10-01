@@ -2826,7 +2826,12 @@ def render_dashboard(version, host, summary, pending, width):
 
         shown = paint(f" {label} ", colour) if colour.startswith("on_") \
             else paint(label, colour)
-        lines.append(f"  {paint(name, 'bold'):<20} {kind:<9} {shown}  "
+        # Green when the device is in the dock, grey when it is not.
+        # Red stays reserved for things that are actually wrong - a sensor
+        # being worn by a worker is its normal state, not a fault.
+        dot = paint("\u25cf", "green") if name in docked \
+            else paint("\u25cb", "dim")
+        lines.append(f"  {dot} {paint(name, 'bold'):<20} {kind:<9} {shown}  "
                      f"{paint(detail, 'dim')}  {upload}")
     lines.append("")
 

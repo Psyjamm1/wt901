@@ -2830,6 +2830,35 @@ def render_dashboard(version, host, summary, pending, width):
                      f"{paint(detail, 'dim')}  {upload}")
     lines.append("")
 
+    # Re-encoding
+    enc = read_state("transcoder")
+    if TRANSCODE or enc:
+        head = paint("PROCESSING", "blue", "bold")
+        phase = enc.get("phase")
+        waiting = enc.get("pending", 0)
+        if phase == "working" and (seconds_since(enc.get("updated")) or 0) < 600:
+            extra = ""
+            if enc.get("pace"):
+                extra += f"  {enc['pace']:.1f}x real time"
+            if enc.get("eta"):
+                extra += f"  {short_time(enc['eta'])} left"
+            state = paint(f"re-encoding {enc.get('file')}  "
+                          f"{enc.get('percent', 0)}%{extra}", "yellow", "bold")
+        elif phase == "error":
+            brief = " ".join((enc.get("error") or "").split())[:90]
+            state = paint(f"ERROR: {brief}", "red", "bold")
+        elif waiting:
+            state = paint(f"{waiting} videos waiting", "yellow")
+        else:
+            state = paint("idle, nothing to re-encode", "green")
+        lines.append(f"{head}  {state}")
+        saved = enc.get("saved", 0)
+        where = "GPU" if enc.get("encoder") == "gpu" else "CPU"
+        lines.append(f"  {TRANSCODE_HEIGHT}p on {where}   "
+                     f"waiting {waiting} ({human(enc.get('pending_bytes', 0))})"
+                     + (f"   space reclaimed {human(saved)}" if saved else ""))
+        lines.append("")
+
     # Uploader
     up = read_state("uploader")
     head = paint("CLOUD UPLOAD", "blue", "bold")
@@ -2859,35 +2888,6 @@ def render_dashboard(version, host, summary, pending, width):
                      f"waiting {waiting} ({wbytes})   "
                      f"last success {ago(up.get('last_ok'))}")
     lines.append("")
-
-    # Re-encoding
-    enc = read_state("transcoder")
-    if TRANSCODE or enc:
-        head = paint("PROCESSING", "blue", "bold")
-        phase = enc.get("phase")
-        waiting = enc.get("pending", 0)
-        if phase == "working" and (seconds_since(enc.get("updated")) or 0) < 600:
-            extra = ""
-            if enc.get("pace"):
-                extra += f"  {enc['pace']:.1f}x real time"
-            if enc.get("eta"):
-                extra += f"  {short_time(enc['eta'])} left"
-            state = paint(f"re-encoding {enc.get('file')}  "
-                          f"{enc.get('percent', 0)}%{extra}", "yellow", "bold")
-        elif phase == "error":
-            brief = " ".join((enc.get("error") or "").split())[:90]
-            state = paint(f"ERROR: {brief}", "red", "bold")
-        elif waiting:
-            state = paint(f"{waiting} videos waiting", "yellow")
-        else:
-            state = paint("idle, nothing to re-encode", "green")
-        lines.append(f"{head}  {state}")
-        saved = enc.get("saved", 0)
-        where = "GPU" if enc.get("encoder") == "gpu" else "CPU"
-        lines.append(f"  {TRANSCODE_HEIGHT}p on {where}   "
-                     f"waiting {waiting} ({human(enc.get('pending_bytes', 0))})"
-                     + (f"   space reclaimed {human(saved)}" if saved else ""))
-        lines.append("")
 
     # Recent events
     lines.append(paint("RECENT", "blue", "bold"))

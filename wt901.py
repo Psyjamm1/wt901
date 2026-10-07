@@ -594,6 +594,23 @@ def find_volumes():
 LABEL_MAX = 11      # both FAT32 and exFAT stop at eleven characters
 
 
+def find_admin_tool(name):
+    """Locate a system tool that may live outside a user's PATH.
+
+    Debian keeps fatlabel and exfatlabel in /usr/sbin, which is not on the
+    PATH of an ordinary user - so a plain lookup reports them as missing
+    even though sudo would run them perfectly well.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    for folder in ("/usr/sbin", "/sbin", "/usr/local/sbin"):
+        candidate = Path(folder) / name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def check_label(name):
     name = name.strip().upper()
     if not name:
@@ -649,10 +666,11 @@ def label_device(new_name, pick=None):
         return 1
 
     device = devices[0]
-    tool = "fatlabel" if device["fstype"] == "vfat" else "exfatlabel"
-    if not shutil.which(tool):
-        package = "dosfstools" if tool == "fatlabel" else "exfatprogs"
-        print(f"{tool} is missing: sudo apt install -y {package}")
+    tool = find_admin_tool("fatlabel" if device["fstype"] == "vfat"
+                           else "exfatlabel")
+    if not tool:
+        package = "dosfstools" if device["fstype"] == "vfat" else "exfatprogs"
+        print(f"the labelling tool is missing: sudo apt install -y {package}")
         return 1
 
     print(f"{device['path']}  {device['fstype']}  "

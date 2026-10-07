@@ -39,9 +39,12 @@ import hashlib
 import json
 import os
 import platform
+import re
+import socket
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +56,31 @@ from pathlib import Path
 OUT_DIR = Path.home() / "Projects" / "wt901-data"
 
 POLL_INTERVAL = 10.0      # watch-mode poll period, seconds
+
+# Upload to cloud storage through rclone. Empty string disables uploading.
+# The value is an rclone remote plus path, e.g. "cloud:farm-data".
+# Set it here or pass --remote on the command line.
+UPLOAD_REMOTE = ""
+UPLOAD_INTERVAL = 30.0    # seconds between upload passes
+DELETE_AFTER_UPLOAD = False   # free local disk once a session is verified remotely
+
+DEVICE_RETRY = 60.0       # seconds before retrying a device that failed
+MAX_PARALLEL = 4          # devices collected at the same time
+# Re-encode video after it has been copied. The camera records at around
+# 100 Mbit/s, which is far more than watching hand movements needs; 720p at
+# a sane bitrate is roughly thirty times smaller.
+TRANSCODE = False          # turn on with --transcode
+TRANSCODE_HEIGHT = 720     # output height; width follows the aspect ratio
+TRANSCODE_CRF = 28         # lower means better quality and bigger files
+TRANSCODE_PRESET = "veryfast"
+TRANSCODE_KEEP_ORIGINAL = False
+TRANSCODE_HW = "auto"      # auto, vaapi or none
+TRANSCODE_THREADS = 0      # 0 lets ffmpeg decide
+TRANSCODE_NICE = 10        # keep encoding from starving the copying
+TRANSCODE_INTERVAL = 20.0
+
+READY_SHOW_MINUTES = 30   # how long the dashboard keeps saying "can be taken"
+STALE_HOURS = 36          # flag a device that has not synced for this long
 SETTLE_DELAY = 3.0        # settle time after a volume mounts
 
 MIN_FILE_SIZE = 128       # smaller files are treated as junk, bytes
@@ -152,6 +180,57 @@ def save_state(seen):
             json.dump(sorted(seen), handle, indent=1)
     except OSError as exc:
         log(f"  could not save state: {exc}")
+
+
+# --------------------------------------------------------------------------
+# Live state shared with the dashboard
+# --------------------------------------------------------------------------
+
+# State files that describe background jobs, not physical devices
+SERVICE_STATES = {"uploader", "transcoder"}
+
+
+def state_dir():
+    return OUT_DIR / "state"
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def read_state(name):
+    try:
+        return json.loads((state_dir() / f"{name}.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(name, **fields):
+    """Merge fields into a small JSON file, written atomically.
+
+    The collector, the uploader and the dashboard are separate processes
+    or threads; replace() guarantees a reader never sees half a file.
+    """
+    try:
+        folder = state_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        data = read_state(name)
+        data.update(fields)
+        data["updated"] = now_iso()
+        tmp = folder / f".{name}.tmp"
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(folder / f"{name}.json")
+    except OSError:
+        pass
+
+
+def seconds_since(iso):
+    if not iso:
+        return None
+    try:
+        return (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
+    except ValueError:
+        return None
 
 
 def safe_name(text):
@@ -393,9 +472,96 @@ def convert_file(path):
 # Finding volumes and files
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Mounting USB media ourselves (Linux)
+#
+# The desktop only auto-mounts a device when it appears. Once this program
+# unmounts a volume - which is how a worker sees that a device is finished -
+# nothing will ever mount it again while it stays plugged in. So on Linux we
+# mount removable filesystems ourselves through udisksctl, which needs no
+# root, and simply remember the ones we have already finished with.
+# --------------------------------------------------------------------------
+
+MOUNT_RETRY = 30.0
+_mount_attempts = {}
+
+
+def usb_filesystems():
+    """Removable USB filesystems, whether or not they are mounted."""
+    if platform.system() != "Linux":
+        return []
+    try:
+        result = subprocess.run(
+            ["lsblk", "--json", "-o",
+             "PATH,LABEL,FSTYPE,MOUNTPOINT,TRAN,UUID,TYPE"],
+            capture_output=True, text=True, timeout=10)
+        data = json.loads(result.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+    found = []
+
+    def walk(nodes, transport):
+        for node in nodes:
+            carried = node.get("tran") or transport
+            if node.get("fstype") and carried == "usb":
+                found.append({
+                    "path": node.get("path"),
+                    "label": node.get("label") or "",
+                    "fstype": (node.get("fstype") or "").lower(),
+                    "uuid": node.get("uuid") or node.get("path"),
+                    "mountpoint": node.get("mountpoint"),
+                })
+            walk(node.get("children") or [], carried)
+
+    walk(data.get("blockdevices", []), None)
+    return found
+
+
+def mount_new_media(skip_uuids):
+    """Mount anything removable that is not mounted and not already done."""
+    for device in usb_filesystems():
+        if device["mountpoint"] or not device["path"]:
+            continue
+        if device["uuid"] in skip_uuids:
+            continue
+
+        moment = time.monotonic()
+        if moment - _mount_attempts.get(device["path"], 0) < MOUNT_RETRY:
+            continue
+        _mount_attempts[device["path"]] = moment
+
+        try:
+            result = subprocess.run(
+                ["udisksctl", "mount", "-b", device["path"],
+                 "--no-user-interaction"],
+                capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log(f"could not mount {device['path']}: {exc}")
+            continue
+
+        name = device["label"] or device["path"]
+        if result.returncode == 0:
+            log(f"mounted {name}")
+        else:
+            message = (result.stderr or result.stdout).strip().splitlines()
+            log(f"could not mount {name}: {message[-1] if message else '?'}")
+
+
+def volume_uuid(volume):
+    for device in usb_filesystems():
+        if device["mountpoint"] == str(volume):
+            return device["uuid"]
+    return None
+
+
 def find_volumes():
     found = []
-    for root in mount_roots():
+    roots = [r for r in mount_roots() if r.is_dir()]
+    # /media contains /media/<user>, which is itself a mount root on Linux,
+    # not a device. Never report a root as a volume.
+    root_set = {r.resolve() for r in roots}
+    for root in roots:
         if not root.is_dir():
             continue
         try:
@@ -409,11 +575,112 @@ def find_volumes():
                 continue
             if entry.is_symlink():
                 continue
+            try:
+                if entry.resolve() in root_set:
+                    continue
+            except OSError:
+                continue
             if VOLUME_FILTER and VOLUME_FILTER.lower() not in entry.name.lower():
                 continue
             if entry not in found:
                 found.append(entry)
     return found
+
+
+# --------------------------------------------------------------------------
+# Naming cards
+# --------------------------------------------------------------------------
+
+LABEL_MAX = 11      # both FAT32 and exFAT stop at eleven characters
+
+
+def check_label(name):
+    name = name.strip().upper()
+    if not name:
+        return None, "the name is empty"
+    if len(name) > LABEL_MAX:
+        return None, f"too long: {len(name)} characters, {LABEL_MAX} is the limit"
+    if not all(c.isalnum() or c in "-_" for c in name):
+        return None, "use letters, digits, - and _ only"
+    return name, None
+
+
+def label_device(new_name, pick=None):
+    """Rename the card that is plugged in right now.
+
+    Doing this by hand means unmounting, choosing between fatlabel and
+    exfatlabel, and typing a device path - one wrong letter renames the
+    wrong disk. Ten cameras is nine chances to get it wrong.
+    """
+    name, problem = check_label(new_name)
+    if problem:
+        print(f"bad name: {problem}")
+        return 1
+
+    if platform.system() == "Darwin":
+        volumes = [v for v in find_volumes()
+                   if pick is None or pick.lower() in v.name.lower()]
+        if len(volumes) != 1:
+            print("plug in exactly one card, or narrow it down with --volume")
+            for v in volumes:
+                print(f"  {v}")
+            return 1
+        result = subprocess.run(["diskutil", "rename", str(volumes[0]), name],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stderr.strip() or result.stdout.strip())
+            return 1
+        print(f"renamed {volumes[0].name} -> {name}")
+        return 0
+
+    devices = [d for d in usb_filesystems()
+               if d["fstype"] in ("vfat", "exfat")
+               and not any(d["label"].upper().startswith(skip)
+                           for skip in CAMERA_SKIP_LABELS)]
+    if pick:
+        devices = [d for d in devices
+                   if pick.lower() in (d["label"] or d["path"]).lower()]
+
+    if len(devices) != 1:
+        print("plug in exactly one card, or narrow it down with --volume\n")
+        for d in devices:
+            print(f"  {d['path']:<14} {d['fstype']:<6} "
+                  f"label={d['label'] or '(none)'}")
+        return 1
+
+    device = devices[0]
+    tool = "fatlabel" if device["fstype"] == "vfat" else "exfatlabel"
+    if not shutil.which(tool):
+        package = "dosfstools" if tool == "fatlabel" else "exfatprogs"
+        print(f"{tool} is missing: sudo apt install -y {package}")
+        return 1
+
+    print(f"{device['path']}  {device['fstype']}  "
+          f"{device['label'] or '(no label)'} -> {name}")
+
+    if device["mountpoint"]:
+        subprocess.run(["udisksctl", "unmount", "-b", device["path"],
+                        "--no-user-interaction"], capture_output=True)
+
+    result = subprocess.run(["sudo", tool, device["path"], name],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print((result.stderr or result.stdout).strip()[:300])
+        return 1
+
+    # Reading it back is the only proof the label really took
+    check = subprocess.run(["sudo", tool, device["path"]],
+                           capture_output=True, text=True)
+    written = (check.stdout or "").strip().splitlines()
+    got = written[-1].strip() if written else ""
+    subprocess.run(["udisksctl", "mount", "-b", device["path"],
+                    "--no-user-interaction"], capture_output=True)
+
+    if got.upper() != name:
+        print(f"the card still reports {got!r}; unplug and plug it back in")
+        return 1
+    print(f"done: the card is now {name}")
+    return 0
 
 
 def device_kind(volume):
@@ -425,7 +692,10 @@ def device_kind(volume):
     except OSError:
         return None
 
-    if volume.name.upper() in CAMERA_SKIP_LABELS:
+    # A second camera's built-in storage mounts as OsmoAction1 and so on,
+    # so match on the prefix rather than the exact label.
+    if any(volume.name.upper().startswith(label)
+           for label in CAMERA_SKIP_LABELS):
         return None
     dcim = volume / "DCIM"
     try:
@@ -497,15 +767,57 @@ def digest(path, chunk=1024 * 1024):
 # Single-instance lock
 # --------------------------------------------------------------------------
 
-def lock_path():
-    return OUT_DIR / "collector.lock"
+def lock_path(name="collector"):
+    return OUT_DIR / f"{name}.lock"
 
 
 class Busy(Exception):
     """Another instance is already working on this volume."""
 
 
-def acquire_lock(stale_after=900):
+def holder_alive(text):
+    """Is the process that wrote this lock still running?
+
+    A lock left behind by a killed collector - a service restart during a
+    copy, say - would otherwise block the device until it went stale.
+    """
+    match = re.search(r"pid (\d+)", text or "")
+    if not match:
+        return True
+    try:
+        os.kill(int(match.group(1)), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def clear_stuck_state():
+    """Reset devices left mid-copy by a collector that is no longer running."""
+    folder = state_dir()
+    if not folder.is_dir():
+        return
+    for path in sorted(folder.glob("*.json")):
+        if path.stem in SERVICE_STATES:
+            continue
+        if read_state(path.stem).get("phase") in ("checking", "copying",
+                                                  "decoding"):
+            write_state(path.stem, phase="interrupted", finished=now_iso(),
+                        error="collector stopped mid-copy - "
+                              "reconnect the device to resume")
+            log(f"{path.stem}: was left mid-copy, marked for resume")
+
+    for lock in sorted(OUT_DIR.glob("collector*.lock")):
+        try:
+            if not holder_alive(lock.read_text()):
+                lock.unlink()
+                log(f"removed stale lock {lock.name}")
+        except OSError:
+            pass
+
+
+def acquire_lock(stale_after=900, name="collector"):
     """Take an exclusive lock, or raise Busy.
 
     The monitor and the launchd agent both react to a mount, so without
@@ -514,14 +826,15 @@ def acquire_lock(stale_after=900):
     is ignored after stale_after seconds.
     """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = lock_path()
+    path = lock_path(name)
 
     if path.exists():
         try:
+            text = path.read_text().strip()
             age = time.time() - path.stat().st_mtime
-            if age < stale_after:
-                raise Busy(path.read_text().strip() or "another instance")
-            path.unlink()
+            if age < stale_after and holder_alive(text):
+                raise Busy(text or "another instance")
+            path.unlink()          # dead owner, or long forgotten
         except OSError:
             pass
 
@@ -534,9 +847,9 @@ def acquire_lock(stale_after=900):
     return path
 
 
-def release_lock():
+def release_lock(name="collector"):
     try:
-        lock_path().unlink()
+        lock_path(name).unlink()
     except OSError:
         pass
 
@@ -544,6 +857,35 @@ def release_lock():
 # --------------------------------------------------------------------------
 # Main workflow
 # --------------------------------------------------------------------------
+
+RESUME_REWIND = 8 * 1024 * 1024      # bytes dropped from a partial file
+
+
+def verified_prefix(source, part, length, hasher, chunk):
+    """Does the first `length` bytes of `part` really match `source`?
+
+    Only the last stretch is compared byte for byte: writes are sequential,
+    so damage lands at the end, and comparing the whole prefix would mean
+    re-reading it from the device and losing the point of resuming.
+    """
+    compare_from = max(0, length - RESUME_REWIND)
+    try:
+        with open(part, "rb") as existing, open(source, "rb") as original:
+            position = 0
+            while position < length:
+                block = existing.read(min(chunk, length - position))
+                if not block:
+                    return False
+                hasher.update(block)
+                if position + len(block) > compare_from:
+                    original.seek(position)
+                    if original.read(len(block)) != block:
+                        return False
+                position += len(block)
+    except OSError:
+        return False
+    return True
+
 
 def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
     """Copy in a single pass, hashing the bytes as they are read.
@@ -553,14 +895,38 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
     the checksums would differ for no real reason. We hash exactly what
     we read, then compare it against what landed on disk.
     """
-    source_hash = hashlib.sha256()
-    copied_bytes = 0
-    try:
-        total = source.stat().st_size
-    except OSError:
-        total = 0
+    # Stat the source before touching anything. If the device has gone
+    # away, give up immediately: carrying on would compare the partial
+    # file against a size of zero and throw away a good resume point.
+    total = source.stat().st_size
 
-    with open(source, "rb") as src, open(target, "wb") as dst:
+    # Copy into a .part file and rename only once it is verified. A half
+    # copied file therefore never looks finished, and an interrupted
+    # transfer can pick up where it stopped instead of starting over.
+    part = target.with_name(target.name + ".part")
+    resume_from = 0
+    source_hash = hashlib.sha256()
+    if part.exists():
+        done = part.stat().st_size
+        # Drop the tail before resuming. An interrupted write can leave
+        # buffered bytes missing or partly written, and hashing our own
+        # output against itself would never notice: both sides would be
+        # computed from the same damaged bytes.
+        done = max(0, min(done, total) - RESUME_REWIND)
+        if done > 0 and verified_prefix(source, part, done, source_hash, chunk):
+            resume_from = done
+        else:
+            source_hash = hashlib.sha256()
+            part.unlink()
+
+    if resume_from:
+        with open(part, "r+b") as existing:
+            existing.truncate(resume_from)
+    copied_bytes = resume_from
+    mode = "ab" if resume_from else "wb"
+    with open(source, "rb") as src, open(part, mode) as dst:
+        if resume_from:
+            src.seek(resume_from)
         while True:
             block = src.read(chunk)
             if not block:
@@ -572,7 +938,7 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
                 on_progress(copied_bytes, total)
 
     target_hash = hashlib.sha256()
-    with open(target, "rb") as dst:
+    with open(part, "rb") as dst:
         while True:
             block = dst.read(chunk)
             if not block:
@@ -580,8 +946,10 @@ def copy_verified(source, target, chunk=1024 * 1024, on_progress=None):
             target_hash.update(block)
 
     if source_hash.hexdigest() != target_hash.hexdigest():
+        part.unlink()
         raise OSError("copy does not match the bytes read")
 
+    part.replace(target)
     return copied_bytes
 
 
@@ -615,6 +983,28 @@ def video_stamp(path):
     return None
 
 
+def open_session(device_dir):
+    """Folder for this collection, reusing one that was left unfinished.
+
+    Partial .part files live inside the session folder, so a copy that was
+    cut short can only resume if the next attempt lands in the same place.
+    A fresh folder every time would silently restart every transfer.
+    """
+    sessions = device_dir / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = sorted((p for p in sessions.iterdir() if p.is_dir()),
+                          key=lambda p: p.name, reverse=True)
+    except OSError:
+        existing = []
+    for path in existing:
+        if not (path / ".complete").exists() and not (path / ".uploaded").exists():
+            return path
+    path = sessions / datetime.now().strftime("%Y%m%d_%H%M%S")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
     seen = load_state()
     everything = camera_files(volume)
@@ -627,12 +1017,14 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
     total = sum(f.stat().st_size for f in fresh)
     log(f"camera {volume.name}: {len(fresh)} new videos, {human(total)}")
 
-    device_dir = OUT_DIR / safe_name(volume.name)
-    session = device_dir / "sessions" / datetime.now().strftime("%Y%m%d_%H%M%S")
-    session.mkdir(parents=True, exist_ok=True)
+    session = open_session(OUT_DIR / safe_name(volume.name))
 
     copied, failed = [], []
+    interrupted = False
     for source in fresh:
+        if not volume.is_dir():
+            interrupted = True
+            break
         target = session / source.name
         ok, size_bytes = False, 0
         for attempt in range(1, COPY_ATTEMPTS + 1):
@@ -646,15 +1038,24 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
                 ok = True
                 break
             except OSError as exc:
+                if not volume.is_dir():
+                    # Unplugged mid-copy. Retrying against a path that no
+                    # longer exists only produces confusing errors.
+                    log(f"  {source.name}: device disconnected during copy")
+                    interrupted = True
+                    break
                 log(f"  {source.name}: attempt {attempt} failed - {exc}")
-                try:
-                    if target.exists():
-                        target.unlink()
-                except OSError:
-                    pass
+                # The .part file is deliberately kept: the next attempt,
+                # or the next time the device is plugged in, resumes from it.
                 if attempt < COPY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
+                if not source.exists() or not volume.is_dir():
+                    log(f"  {source.name}: device disconnected during copy")
+                    interrupted = True
+                    break
 
+        if interrupted:
+            break
         if not ok:
             log(f"  {source.name} skipped, original left on the camera")
             failed.append(source)
@@ -678,7 +1079,16 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
 
     save_state(seen)
 
+    if interrupted:
+        write_state(safe_name(volume.name), phase="interrupted",
+                    finished=now_iso(),
+                    error="unplugged during copy - will resume when reconnected")
+        log("  interrupted; partial file kept, will resume on reconnect")
+        return False
+
     if not copied:
+        write_state(safe_name(volume.name), phase="error", finished=now_iso(),
+                    error=f"{len(failed)} videos unreadable")
         notify("Camera download failed",
                f"{len(failed)} videos unreadable. Camera data is intact.")
         return False
@@ -695,6 +1105,17 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
                 proxy = source.with_suffix(".LRF")
                 if not CAMERA_KEEP_LRF and proxy.exists():
                     proxy.unlink()
+                # Gallery thumbnails in MISC/THM share the video's stem
+                # exactly (DJI_..._0001_D.THM / .SCR), so matching on the
+                # full stem cannot touch another recording's files.
+                thumbs = volume / "MISC" / "THM"
+                if thumbs.is_dir():
+                    for leftover in thumbs.rglob(source.stem + ".*"):
+                        if leftover.suffix.upper() in (".THM", ".SCR"):
+                            try:
+                                leftover.unlink()
+                            except OSError:
+                                pass
             except OSError as exc:
                 log(f"  could not delete {source.name}: {exc}")
         log(f"  removed {removed} videos from the camera")
@@ -702,6 +1123,10 @@ def _collect_camera(volume, delete_after, progress=None, done_bytes=None):
         log("  camera not cleared (no --delete)")
 
     copied_bytes = sum(t.stat().st_size for _, t in copied)
+    (session / ".complete").write_text(now_iso())
+    write_state(safe_name(volume.name), phase="done", kind="camera",
+                finished=now_iso(), last_done=now_iso(), files=len(copied),
+                bytes=copied_bytes, percent=100, error=None)
     notify("Camera footage collected",
            f"{len(copied)} videos, {human(copied_bytes)}. The camera can be taken.")
     unmount(volume)
@@ -713,18 +1138,79 @@ def collect(volume, delete_after, progress=None, done_bytes=None):
     if not is_sensor(volume):
         return False
 
+    dev = safe_name(volume.name)
+    # One lock per device, not one for the whole program: two cameras in
+    # the dock must not block each other.
+    lock_name = f"collector-{dev}"
     try:
-        acquire_lock()
+        acquire_lock(name=lock_name)
     except Busy as who:
-        log(f"volume {volume.name}: skipped, {who} is already collecting")
+        log(f"volume {volume.name}: skipped, {who} is already collecting it")
         return False
 
+    kind = device_kind(volume)
     try:
-        if device_kind(volume) == "camera":
-            return _collect_camera(volume, delete_after, progress, done_bytes)
-        return _collect(volume, delete_after, progress, done_bytes)
+        files = camera_files(volume) if kind == "camera" else data_files(volume)
+        seen = load_state()
+        total = sum(f.stat().st_size for f in files
+                    if file_key(f, volume.name) not in seen)
+    except OSError:
+        total = 0
+
+    # Clear the figures from the previous run, or "checking" would still
+    # show the bytes and speed of a transfer that is already over.
+    write_state(dev, phase="checking", kind=kind, started=now_iso(),
+                volume=str(volume), total=total, percent=0, copied=0,
+                speed=None, eta=None, took=None, file=None, error=None)
+
+    if done_bytes is None:
+        done_bytes = [0]
+    last_write = [0.0]
+    window = []          # recent (time, bytes) pairs, for a live speed
+    began = time.monotonic()
+
+    def tracker(got, file_total, name=""):
+        if progress:
+            progress(got, file_total, name)
+        moment = time.monotonic()
+        overall = done_bytes[0] + got
+        window.append((moment, overall))
+        while len(window) > 2 and moment - window[0][0] > 10:
+            window.pop(0)
+
+        if moment - last_write[0] < 0.5:
+            return
+        last_write[0] = moment
+
+        # Speed over the last few seconds rather than the whole transfer:
+        # a resumed copy would otherwise look impossibly fast at first.
+        speed = 0.0
+        span = window[-1][0] - window[0][0]
+        if span > 0.5:
+            speed = (window[-1][1] - window[0][1]) / span
+        left = max(0, total - overall)
+        percent = int(100 * overall / total) if total else 0
+        write_state(dev, phase="copying", file=name, copied=overall,
+                    total=total, speed=speed,
+                    eta=(left / speed) if speed > 1 else None,
+                    percent=min(percent, 99))
+
+    try:
+        if kind == "camera":
+            ok = _collect_camera(volume, delete_after, tracker, done_bytes)
+        else:
+            ok = _collect(volume, delete_after, tracker, done_bytes)
+    except Exception as exc:
+        write_state(dev, phase="error", finished=now_iso(), error=str(exc)[:200])
+        raise
     finally:
-        release_lock()
+        release_lock(lock_name)
+
+    if ok:
+        write_state(dev, took=time.monotonic() - began, speed=None, eta=None)
+    elif read_state(dev).get("phase") in ("checking", "copying", "decoding"):
+        write_state(dev, phase="nothing_new", finished=now_iso())
+    return ok
 
 
 def _collect(volume, delete_after, progress=None, done_bytes=None):
@@ -743,13 +1229,15 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
 
     # Each sensor gets its own folder, keyed on the volume label.
     # Rename a card with: diskutil rename "/Volumes/NO NAME" COW01
-    device_dir = OUT_DIR / safe_name(volume.name)
-    session = device_dir / "sessions" / datetime.now().strftime("%Y%m%d_%H%M%S")
-    session.mkdir(parents=True, exist_ok=True)
+    session = open_session(OUT_DIR / safe_name(volume.name))
 
     copied = []
     failed = []
+    interrupted = False
     for source in fresh:
+        if not volume.is_dir():
+            interrupted = True
+            break
         target = session / source.name
         counter = 1
         while target.exists():
@@ -769,15 +1257,22 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
                 ok = True
                 break
             except OSError as exc:
+                if not volume.is_dir():
+                    log(f"  {source.name}: device disconnected during copy")
+                    interrupted = True
+                    break
                 log(f"  {source.name}: attempt {attempt} failed - {exc}")
-                try:
-                    if target.exists():
-                        target.unlink()      # never leave a partial copy behind
-                except OSError:
-                    pass
+                # The .part file is deliberately kept: the next attempt,
+                # or the next time the device is plugged in, resumes from it.
                 if attempt < COPY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
+                if not source.exists() or not volume.is_dir():
+                    log(f"  {source.name}: device disconnected during copy")
+                    interrupted = True
+                    break
 
+        if interrupted:
+            break
         if not ok:
             log(f"  {source.name} skipped, original left on the card")
             failed.append(source)
@@ -789,8 +1284,17 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
 
     save_state(seen)
 
+    if interrupted:
+        write_state(safe_name(volume.name), phase="interrupted",
+                    finished=now_iso(),
+                    error="unplugged during copy - will resume when reconnected")
+        log("  interrupted; partial file kept, will resume on reconnect")
+        return False
+
     if not copied:
         log("nothing could be copied")
+        write_state(safe_name(volume.name), phase="error", finished=now_iso(),
+                    error=f"{len(failed)} files unreadable")
         notify("Download failed",
                f"{len(failed)} files unreadable. Card data is intact.")
         return False
@@ -801,6 +1305,7 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
         log(f"unreadable, left on the card: {names}")
 
     # Decode to JSON Lines, merging across file boundaries
+    write_state(safe_name(volume.name), phase="decoding")
     raw_files = [t for _, t in copied]
     samples_total, jsonl_total = convert_all(raw_files, session)
     if jsonl_total:
@@ -851,6 +1356,11 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
     else:
         log("  card not cleared (no --delete)")
 
+    (session / ".complete").write_text(now_iso())
+    write_state(safe_name(volume.name), phase="done", kind="bracelet",
+                finished=now_iso(), last_done=now_iso(), files=len(copied),
+                bytes=dir_bytes(session), samples=samples_total,
+                percent=100, error=None)
     notify(
         "Sensor data collected",
         f"{len(copied)} files, {total_mb:.0f} MB, "
@@ -860,8 +1370,560 @@ def _collect(volume, delete_after, progress=None, done_bytes=None):
     return True
 
 
+# --------------------------------------------------------------------------
+# Upload to cloud storage (rclone)
+# --------------------------------------------------------------------------
+
+MARKERS = (".complete", ".uploaded")
+
+
+def session_dirs():
+    found = []
+    if not OUT_DIR.is_dir():
+        return found
+    for device in sorted(OUT_DIR.iterdir()):
+        sessions = device / "sessions"
+        if device.is_dir() and sessions.is_dir():
+            found.extend(p for p in sessions.iterdir() if p.is_dir())
+    return found
+
+
+def device_busy(device):
+    """True while a collector is working on this device."""
+    if read_state(device).get("phase") in ("checking", "copying", "decoding"):
+        lock = lock_path(f"collector-{device}")
+        try:
+            if lock.exists() and holder_alive(lock.read_text()):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def session_complete(path):
+    """Is this session finished and safe to send to the cloud?
+
+    Uploading a session that is still being written makes rclone fail
+    with "source file is being updated" - and worse, could publish half
+    a video. A session folder is reused while a transfer resumes, so its
+    age alone says nothing.
+    """
+    try:
+        if any(path.glob("*.part")):
+            return False          # a transfer is still unfinished here
+        if device_busy(path.parent.parent.name):
+            return False
+    except OSError:
+        return False
+
+    if (path / ".complete").exists():
+        return True
+    # Sessions collected before completion markers existed: trust them
+    # once they have been quiet for an hour.
+    try:
+        return time.time() - path.stat().st_mtime > 3600 and any(path.iterdir())
+    except OSError:
+        return False
+
+
+def dir_bytes(path):
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_file() and item.name not in MARKERS \
+                and item.suffix != ".part":
+            try:
+                total += item.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def ready_to_upload(path):
+    """Finished collecting, and finished shrinking if we are shrinking."""
+    if not session_complete(path):
+        return False
+    if TRANSCODE:
+        try:
+            if any(needs_transcode(p) for p in path.iterdir()
+                   if p.suffix.upper() in CAMERA_VIDEO_EXTS):
+                return False     # do not send footage we are about to shrink
+        except OSError:
+            return False
+    return True
+
+
+def pending_sessions():
+    return sorted((p for p in session_dirs()
+                   if not (p / ".uploaded").exists() and ready_to_upload(p)),
+                  key=lambda p: p.name)
+
+
+def rclone_args():
+    args = []
+    for marker in MARKERS:
+        args += ["--exclude", marker]
+    # Never publish a partially transferred file
+    args += ["--exclude", "*.part"]
+    return args
+
+
+def upload_session(path, rclone):
+    device = path.parent.parent.name
+    label = f"{device}/{path.name}"
+    dest = f"{UPLOAD_REMOTE.rstrip('/')}/{device}/{path.name}"
+    size = dir_bytes(path)
+
+    write_state("uploader", phase="uploading", session=label, bytes=size,
+                percent=0, started=now_iso(), error=None)
+    log(f"upload {label} ({human(size)}) -> {dest}")
+
+    cmd = [rclone, "copy", str(path), dest, "--checksum",
+           "--retries", "3", "--low-level-retries", "10",
+           "--stats", "2s", "--stats-one-line",
+           "--stats-log-level", "NOTICE"] + rclone_args()
+    last_error = ""
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            match = re.search(r"(\d+)%", line)
+            if match:
+                pace = re.search(r"([\d.]+\s*[KMGT]?i?B/s)", line)
+                eta = re.search(r"ETA\s+(\S+)", line)
+                write_state("uploader", percent=int(match.group(1)),
+                            speed=pace.group(1) if pace else None,
+                            eta=eta.group(1) if eta else None)
+            if "ERROR" in line:
+                last_error = line.strip()[-200:]
+        code = proc.wait()
+    except OSError as exc:
+        code, last_error = -1, str(exc)
+
+    if code != 0:
+        message = last_error or f"rclone exited with code {code}"
+        write_state("uploader", phase="error", error=message, failed_at=now_iso())
+        log(f"  upload failed: {message}")
+        return False
+
+    # Only a remote copy that rclone has checked counts as uploaded
+    check = subprocess.run([rclone, "check", str(path), dest, "--one-way"]
+                           + rclone_args(), capture_output=True, text=True)
+    if check.returncode != 0:
+        message = "remote copy does not match local files"
+        write_state("uploader", phase="error", error=message, failed_at=now_iso())
+        log(f"  upload failed: {message}")
+        return False
+
+    (path / ".uploaded").write_text(json.dumps(
+        {"uploaded": now_iso(), "dest": dest, "bytes": size}, indent=1))
+
+    if DELETE_AFTER_UPLOAD:
+        for item in path.iterdir():
+            if item.is_file() and item.name not in MARKERS \
+                    and not item.name.endswith(".meta.json"):
+                try:
+                    item.unlink()
+                except OSError:
+                    pass
+
+    write_state("uploader", last_ok=now_iso(), last_session=label, percent=100)
+    log(f"  uploaded and verified {label}")
+    return True
+
+
+def upload_pass():
+    """Upload every finished session that is not in the cloud yet."""
+    if not UPLOAD_REMOTE:
+        return
+    pending = pending_sessions()
+    write_state("uploader", remote=UPLOAD_REMOTE, pending=len(pending),
+                pending_bytes=sum(dir_bytes(p) for p in pending))
+
+    rclone = shutil.which("rclone")
+    if not rclone:
+        write_state("uploader", phase="error", error="rclone is not installed")
+        return
+    if not pending:
+        write_state("uploader", phase="idle", error=None)
+        return
+
+    try:
+        acquire_lock(stale_after=6 * 3600, name="uploader")
+    except Busy:
+        return
+    try:
+        for index, path in enumerate(pending):
+            if not upload_session(path, rclone):
+                return
+            rest = pending[index + 1:]
+            write_state("uploader", pending=len(rest),
+                        pending_bytes=sum(dir_bytes(p) for p in rest))
+        write_state("uploader", phase="idle", error=None)
+    finally:
+        release_lock("uploader")
+
+
+# --------------------------------------------------------------------------
+# Re-encoding video (ffmpeg)
+# --------------------------------------------------------------------------
+
+def ffmpeg_bin():
+    return shutil.which("ffmpeg")
+
+
+def video_duration(path):
+    probe = shutil.which("ffprobe")
+    if not probe:
+        return None
+    try:
+        result = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=60)
+        return float(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+# Set once the GPU has proved unreliable on this footage, so we stop
+# wasting a failed attempt on every single file.
+_VAAPI_BROKEN = False
+
+
+def vaapi_available():
+    if TRANSCODE_HW == "none" or _VAAPI_BROKEN:
+        return False
+    if not Path("/dev/dri/renderD128").exists():
+        return False
+    try:
+        result = subprocess.run([ffmpeg_bin(), "-hide_banner", "-encoders"],
+                                capture_output=True, text=True, timeout=30)
+        return "h264_vaapi" in result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def encode_command(source, target, use_vaapi):
+    """Software encoding is the default: predictable size, works anywhere.
+
+    The laptop's integrated GPU is many times faster, so it is used when
+    available - a day of footage would otherwise take a day to re-encode.
+    """
+    if use_vaapi:
+        return [
+            ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+            "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
+            "-vaapi_device", "/dev/dri/renderD128",
+            "-i", str(source),
+            "-vf", f"scale_vaapi=w=-2:h={TRANSCODE_HEIGHT}",
+            "-c:v", "h264_vaapi", "-qp", str(TRANSCODE_CRF),
+            "-c:a", "aac", "-b:a", "64k",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", str(target),
+        ]
+    command = [
+        ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-vf", f"scale=-2:{TRANSCODE_HEIGHT}",
+        "-c:v", "libx264", "-preset", TRANSCODE_PRESET,
+        "-crf", str(TRANSCODE_CRF),
+        "-c:a", "aac", "-b:a", "64k",
+        "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats", str(target),
+    ]
+    if TRANSCODE_THREADS:
+        command[3:3] = ["-threads", str(TRANSCODE_THREADS)]
+    # Encoding is never urgent; copying from a camera is.
+    if TRANSCODE_NICE and shutil.which("nice"):
+        command = ["nice", "-n", str(TRANSCODE_NICE)] + command
+    return command
+
+
+def video_meta(path):
+    return path.with_suffix(".meta.json")
+
+
+TRANSCODE_GIVE_UP = 3
+
+
+def needs_transcode(path):
+    try:
+        meta = json.loads(video_meta(path).read_text())
+    except (OSError, ValueError):
+        return True          # no record of it having been processed
+    if meta.get("transcoded"):
+        return False
+    # A file ffmpeg cannot read must not be retried forever - it would
+    # block every other video behind it.
+    return meta.get("transcode_failures", 0) < TRANSCODE_GIVE_UP
+
+
+def note_transcode_failure(path, reason):
+    record = {}
+    try:
+        record = json.loads(video_meta(path).read_text())
+    except (OSError, ValueError):
+        pass
+    count = record.get("transcode_failures", 0) + 1
+    record.update({"file": path.name, "kind": "video",
+                   "transcode_failures": count,
+                   "transcode_error": reason[:300]})
+    try:
+        video_meta(path).write_text(json.dumps(record, indent=1))
+    except OSError:
+        pass
+    if count >= TRANSCODE_GIVE_UP:
+        log(f"  giving up on {path.name} after {count} attempts; "
+            f"it stays at full size")
+
+
+def pending_videos():
+    found = []
+    for session in session_dirs():
+        if not session_complete(session):
+            continue
+        for path in sorted(session.iterdir()):
+            if path.suffix.upper() in CAMERA_VIDEO_EXTS and needs_transcode(path):
+                found.append(path)
+    return found
+
+
+def transcode_file(path, use_vaapi):
+    before = path.stat().st_size
+    duration = video_duration(path)
+    target = path.with_name(path.stem + ".encoding.mp4")
+    label = f"{path.parent.parent.parent.name}/{path.name}"
+
+    started = time.monotonic()
+    write_state("transcoder", phase="working", file=label, percent=0,
+                bytes=before, started=now_iso(), error=None, eta=None, pace=None,
+                encoder="gpu" if use_vaapi else "cpu")
+    log(f"re-encode {label} ({human(before)}, "
+        f"{'hardware' if use_vaapi else 'software'})")
+
+    complaints = []
+    try:
+        # One pipe for both streams: reading them separately risks blocking
+        # when ffmpeg fills the one we are not reading.
+        proc = subprocess.Popen(encode_command(path, target, use_vaapi),
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line.startswith("out_time_us=") and duration:
+                try:
+                    seconds = int(line.split("=", 1)[1]) / 1_000_000
+                except ValueError:
+                    continue
+                elapsed = time.monotonic() - started
+                pace = seconds / elapsed if elapsed > 1 else 0
+                write_state("transcoder",
+                            percent=min(99, int(100 * seconds / duration)),
+                            pace=round(pace, 2),
+                            eta=((duration - seconds) / pace) if pace else None,
+                            of=duration)
+            elif line and "=" not in line.split(" ")[0]:
+                complaints.append(line)
+                del complaints[:-6]
+        code = proc.wait()
+        problem = " | ".join(complaints)[-300:]
+    except (OSError, subprocess.SubprocessError) as exc:
+        code, problem = -1, str(exc)
+
+    if code != 0 or not target.exists():
+        reason = problem or f"ffmpeg exited with code {code}"
+        target.unlink(missing_ok=True)
+        if use_vaapi:
+            # The GPU chokes on some codecs - 10-bit H.265 in particular.
+            # Software encoding is slower but handles everything.
+            globals()["_VAAPI_BROKEN"] = True
+            log(f"  hardware encoding failed ({reason[:80]}); "
+                f"switching to software for the rest of this run")
+            return transcode_file(path, False)
+        write_state("transcoder", phase="error", error=reason)
+        log(f"  re-encode failed: {reason}")
+        note_transcode_failure(path, reason)
+        return False
+
+    # A truncated output would silently lose footage, so check the length
+    made = video_duration(target)
+    if duration and made and abs(made - duration) > max(2.0, duration * 0.02):
+        message = f"length changed: {duration:.0f}s -> {made:.0f}s"
+        target.unlink(missing_ok=True)
+        if use_vaapi:
+            globals()["_VAAPI_BROKEN"] = True
+            log(f"  hardware encoding produced a short file; "
+                f"switching to software")
+            return transcode_file(path, False)
+        write_state("transcoder", phase="error", error=message)
+        log(f"  re-encode rejected, {message}")
+        note_transcode_failure(path, message)
+        return False
+
+    after = target.stat().st_size
+    if TRANSCODE_KEEP_ORIGINAL:
+        keep = path.with_name(path.stem + ".original" + path.suffix)
+        path.replace(keep)
+    final = path.with_suffix(".MP4")
+    target.replace(final)
+
+    record = {}
+    try:
+        record = json.loads(video_meta(final).read_text())
+    except (OSError, ValueError):
+        pass
+    record.update({"file": final.name, "kind": "video", "transcoded": True,
+                   "bytes": after, "original_bytes": before,
+                   "seconds": round(duration or 0, 1)})
+    try:
+        video_meta(final).write_text(json.dumps(record, indent=1))
+    except OSError:
+        pass
+
+    took = time.monotonic() - started
+    log(f"  {human(before)} -> {human(after)} "
+        f"({before / max(after, 1):.0f}x smaller, {short_time(took)})")
+    write_state("transcoder", last_ok=now_iso(), percent=100,
+                saved=read_state("transcoder").get("saved", 0) + before - after)
+    return True
+
+
+def benchmark(path, seconds=60, heights=None):
+    """Time a few encoder settings on real footage from this camera.
+
+    Guessing at presets is pointless: the answer depends on the machine
+    and on what the camera actually records.
+    """
+    path = Path(path)
+    if not path.exists():
+        print(f"no such file: {path}")
+        return 1
+    if not ffmpeg_bin():
+        print("ffmpeg is not installed")
+        return 1
+
+    duration = video_duration(path)
+    size = path.stat().st_size
+    if not duration:
+        print("cannot read that file")
+        return 1
+
+    rate = size / duration                      # bytes per second of footage
+    sample = min(seconds, duration)
+    print(f"\nsource   {path.name}")
+    print(f"         {human(size)}, {short_time(duration)}, "
+          f"{human(rate)}/s of footage")
+    print(f"sample   {sample:.0f} s from the middle\n")
+
+    start = max(0, duration / 2 - sample / 2)
+    heights = heights or [TRANSCODE_HEIGHT]
+    combos = [(h, p, c) for h in heights
+              for p, c in (("ultrafast", TRANSCODE_CRF),
+                           ("veryfast", TRANSCODE_CRF),
+                           ("faster", TRANSCODE_CRF),
+                           ("veryfast", TRANSCODE_CRF - 4),
+                           ("veryfast", TRANSCODE_CRF + 4))]
+
+    print(f"  {'height':>6} {'preset':<10} {'crf':>4} {'time':>7} "
+          f"{'size/min':>9} {'smaller':>8} {'speed':>7}  hours per 8 h shift")
+    print("  " + "-" * 78)
+
+    temp = Path("/tmp") / f"wt901-bench-{os.getpid()}.mp4"
+    for height, preset, crf in combos:
+        command = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+                   "-ss", f"{start:.2f}", "-t", f"{sample:.2f}",
+                   "-i", str(path), "-vf", f"scale=-2:{height}",
+                   "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+                   "-c:a", "aac", "-b:a", "64k", str(temp)]
+        if TRANSCODE_THREADS:
+            command[3:3] = ["-threads", str(TRANSCODE_THREADS)]
+        began = time.monotonic()
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=1800)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"  {height:>6} {preset:<10} {crf:>4}   failed: {exc}")
+            continue
+        took = time.monotonic() - began
+        if result.returncode != 0 or not temp.exists():
+            note = " ".join((result.stderr or "").split())[:50]
+            print(f"  {height:>6} {preset:<10} {crf:>4}   failed: {note}")
+            continue
+
+        out = temp.stat().st_size
+        per_minute = out / sample * 60
+        smaller = (rate * sample) / max(out, 1)
+        speed = sample / took                   # times faster than realtime
+        shift_hours = 8 / speed
+        print(f"  {height:>6} {preset:<10} {crf:>4} {took:>6.1f}s "
+              f"{human(per_minute):>9} {smaller:>7.0f}x {speed:>6.1f}x "
+              f"  {shift_hours:>5.1f} h")
+        temp.unlink(missing_ok=True)
+
+    print("\n  speed is relative to real time: 4x means an hour of footage")
+    print("  takes 15 minutes. The last column is how long one 8 hour shift")
+    print("  of continuous recording would take to re-encode.\n")
+    return 0
+
+
+def transcode_pass():
+    if not TRANSCODE:
+        return
+    pending = pending_videos()
+    write_state("transcoder", pending=len(pending),
+                pending_bytes=sum(p.stat().st_size for p in pending
+                                  if p.exists()))
+    if not ffmpeg_bin():
+        write_state("transcoder", phase="error", error="ffmpeg is not installed")
+        return
+    if not pending:
+        write_state("transcoder", phase="idle", error=None)
+        return
+
+    try:
+        acquire_lock(stale_after=6 * 3600, name="transcoder")
+    except Busy:
+        return
+    try:
+        use_vaapi = vaapi_available()
+        failures = 0
+        for index, path in enumerate(pending):
+            if not path.exists():
+                continue
+            if not transcode_file(path, use_vaapi):
+                failures += 1      # move on; the rest must not wait for it
+            rest = [p for p in pending[index + 1:] if p.exists()]
+            write_state("transcoder", pending=len(rest),
+                        pending_bytes=sum(p.stat().st_size for p in rest))
+        if not failures:
+            write_state("transcoder", phase="idle", error=None)
+    finally:
+        release_lock("transcoder")
+
+
+def transcoder_loop():
+    while True:
+        try:
+            transcode_pass()
+        except Exception as exc:
+            log(f"transcoder error: {exc}")
+            write_state("transcoder", phase="error", error=str(exc)[:200])
+        time.sleep(TRANSCODE_INTERVAL)
+
+
+def uploader_loop():
+    while True:
+        try:
+            upload_pass()
+        except Exception as exc:
+            log(f"uploader error: {exc}")
+            write_state("uploader", phase="error", error=str(exc)[:200])
+        time.sleep(UPLOAD_INTERVAL)
+
+
 def run_once(delete_after):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    clear_stuck_state()
     time.sleep(SETTLE_DELAY)
     volumes = find_volumes()
     if not volumes:
@@ -876,6 +1938,8 @@ def run_once(delete_after):
     if not worked:
         names = ", ".join(v.name for v in volumes)
         log(f"triggered on connect: no new recordings on ({names})")
+    transcode_pass()
+    upload_pass()
     return 0
 
 
@@ -919,6 +1983,7 @@ def monitor(delete_after):
     """Watch the dock and show what is happening in the terminal."""
     globals()["QUIET"] = True      # keep the log from breaking the live view
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    clear_stuck_state()
     screen = Screen()
 
     print()
@@ -929,6 +1994,7 @@ def monitor(delete_after):
     print()
 
     known = set()
+    retry_at = {}
     spinner = "|/-\\"
     tick = 0
 
@@ -937,8 +2003,10 @@ def monitor(delete_after):
         sensors = [v for v in volumes if is_sensor(v)]
         current = {v.name for v in sensors}
         known &= current
+        retry_at = {k: v for k, v in retry_at.items() if k in current}
 
-        fresh = [v for v in sensors if v.name not in known]
+        fresh = [v for v in sensors if v.name not in known
+                 and time.monotonic() >= retry_at.get(v.name, 0)]
 
         if not fresh:
             tick += 1
@@ -969,6 +2037,12 @@ def monitor(delete_after):
                             f"{human(overall)}  {speed:.0f} KB/s  {name}")
 
             result = collect(volume, delete_after, progress, done_bytes)
+            phase = read_state(safe_name(volume.name)).get("phase")
+            if result or phase == "nothing_new":
+                known.add(volume.name)
+            else:
+                retry_at[volume.name] = time.monotonic() + DEVICE_RETRY
+                print(f"    will retry in {DEVICE_RETRY:.0f} s")
             screen.done()
             if result:
                 made = sorted((OUT_DIR / "sessions").glob("*/session_*.jsonl"),
@@ -981,7 +2055,6 @@ def monitor(delete_after):
                       f"the sensor can be taken")
             else:
                 print("    no new recordings found")
-            known.add(volume.name)
             print()
 
 
@@ -993,22 +2066,84 @@ def watch(delete_after):
         log("card cleanup enabled")
     if VOLUME_FILTER:
         log(f"volume filter: {VOLUME_FILTER!r}")
+    if UPLOAD_REMOTE:
+        log(f"uploading to {UPLOAD_REMOTE} every {UPLOAD_INTERVAL:.0f} s")
+        threading.Thread(target=uploader_loop, daemon=True).start()
+    if TRANSCODE:
+        log(f"re-encoding video to {TRANSCODE_HEIGHT}p in the background")
+        threading.Thread(target=transcoder_loop, daemon=True).start()
+    clear_stuck_state()
 
-    known = set()
+    done = set()        # finished while this volume stayed mounted
+    retry_at = {}       # volumes that failed, and when to try them again
+    active = {}         # volumes being collected right now
+    results = {}        # what each finished worker reported
+    settled = set()     # uuids we finished with; do not mount them again
+
+    def worker(volume):
+        name = volume.name
+        try:
+            time.sleep(SETTLE_DELAY)
+            if not volume.is_dir():
+                results[name] = False
+                return
+            uuid = volume_uuid(volume)
+            ok = collect(volume, delete_after)
+            phase = read_state(safe_name(name)).get("phase")
+            finished = bool(ok) or phase == "nothing_new"
+            if finished and uuid:
+                # We unmounted it on purpose; leave it alone until the
+                # device is physically unplugged and put back.
+                settled.add(uuid)
+            results[name] = finished
+        except Exception as exc:
+            log(f"volume {name}: collection crashed - {exc}")
+            results[name] = False
+
     while True:
+        attached = {d["uuid"] for d in usb_filesystems()}
+        settled &= attached          # forget devices that were taken away
+        mount_new_media(settled)
+
         volumes = find_volumes()
         current = {v.name for v in volumes}
-        known &= current                      # forget volumes that went away
+        done &= current                       # forget volumes that went away
+        retry_at = {k: v for k, v in retry_at.items() if k in current}
+
+        # Collect finished workers first so their slots free up
+        for name, thread in list(active.items()):
+            if thread.is_alive():
+                continue
+            del active[name]
+            if results.pop(name, False):
+                done.add(name)
+                retry_at.pop(name, None)
+            else:
+                # A yanked cable, a busy device or an unreadable file: try
+                # again shortly. Writing the device off until it is
+                # unplugged would leave it stuck showing an old error.
+                retry_at[name] = time.monotonic() + DEVICE_RETRY
+                log(f"volume {name}: will retry in {DEVICE_RETRY:.0f} s")
 
         for volume in volumes:
-            if volume.name in known:
+            name = volume.name
+            if name in done or name in active:
                 continue
-            time.sleep(SETTLE_DELAY)
-            if volume.is_dir():
-                collect(volume, delete_after)
-            known.add(volume.name)
+            if not device_kind(volume):
+                done.add(name)          # not ours; ignore it quietly
+                continue
+            if time.monotonic() < retry_at.get(name, 0):
+                continue
+            if len(active) >= MAX_PARALLEL:
+                break
 
-        time.sleep(POLL_INTERVAL)
+            # One thread per device: a camera copying 30 GB must not hold
+            # up the bracelet plugged in beside it.
+            thread = threading.Thread(target=worker, args=(volume,), daemon=True)
+            active[name] = thread
+            thread.start()
+
+        time.sleep(POLL_INTERVAL if not active else 1.0)
 
 
 def list_volumes():
@@ -1019,10 +2154,17 @@ def list_volumes():
     seen = load_state()
     print()
     for volume in volumes:
-        files = data_files(volume)
+        kind = device_kind(volume)
+        if kind == "camera":
+            files = camera_files(volume)
+        elif kind == "bracelet":
+            files = data_files(volume)
+        else:
+            print(f"  {volume}  (not a known device, ignored)")
+            continue
         fresh = [f for f in files if file_key(f, volume.name) not in seen]
         size = sum(f.stat().st_size for f in files) / (1024 * 1024)
-        print(f"  {volume}")
+        print(f"  {volume}  [{kind}]")
         print(f"    {len(files)} files, {len(fresh)} new, {size:.1f} MB")
         for sample in files[:5]:
             print(f"      {sample.name}")
@@ -1489,6 +2631,12 @@ def device_summary():
             # Fall back to file times for sessions collected before metadata
             if not sessions:
                 found = list(sessions_dir.rglob("*.jsonl"))
+                videos = [p for p in sessions_dir.rglob("*")
+                          if p.suffix.upper() in CAMERA_VIDEO_EXTS]
+                if videos and not found:
+                    found, kind = videos, kind or "camera"
+                elif found:
+                    kind = kind or "bracelet"
                 sessions = len(found)
                 size = sum(f.stat().st_size for f in found)
 
@@ -1508,14 +2656,19 @@ def device_summary():
 
 def collector_state():
     """Is a collection running right now, and how long has it been going?"""
-    path = lock_path()
-    if not path.exists():
-        return None
     try:
-        age = time.time() - path.stat().st_mtime
-        return {"holder": path.read_text().strip(), "age_s": round(age)}
+        locks = sorted(OUT_DIR.glob("collector*.lock"))
     except OSError:
         return None
+    for path in locks:
+        try:
+            age = time.time() - path.stat().st_mtime
+            who = path.stem.replace("collector-", "")
+            return {"holder": f"{who} ({path.read_text().strip()})",
+                    "age_s": round(age)}
+        except OSError:
+            continue
+    return None
 
 
 def free_space():
@@ -1588,6 +2741,334 @@ def show_status(as_json=False):
 
 
 # --------------------------------------------------------------------------
+# Live dashboard
+# --------------------------------------------------------------------------
+
+C = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
+    "blue": "\033[34m", "cyan": "\033[36m",
+    "on_red": "\033[41;97;1m", "on_green": "\033[42;30;1m",
+    "on_yellow": "\033[43;30;1m",
+}
+
+
+def short_time(seconds):
+    if seconds is None:
+        return ""
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def paint(text, *styles):
+    return "".join(C[s] for s in styles) + text + C["reset"]
+
+
+def git_version():
+    try:
+        # describe prefers the nearest tag, so a released machine shows
+        # "v1.2.0" while a working copy shows the commit it sits on.
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent),
+             "describe", "--tags", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=3)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "-"
+
+
+def tail_log(lines=8):
+    path = OUT_DIR / "collector.log"
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 16384))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    return text.splitlines()[-lines:]
+
+
+BAD_WORDS = ("fail", "error", "unreadable", "skipped", "stalled")
+
+
+def device_status(name, st, docked, summary_last):
+    """Return (label, colour, detail) for one device - worded for a worker."""
+    phase = st.get("phase")
+    age = seconds_since(st.get("updated"))
+    finished = seconds_since(st.get("finished"))
+
+    if phase in ("checking", "copying", "decoding"):
+        if age is not None and age > 120:
+            return "STALLED", "on_red", "no progress for 2 min - see log"
+        pct = st.get("percent") or 0
+        what = {"checking": "CHECKING", "copying": f"COPYING {pct}%",
+                "decoding": "PROCESSING"}[phase]
+        detail = []
+        if st.get("copied") and st.get("total"):
+            detail.append(f"{human(st['copied'])} of {human(st['total'])}")
+        if st.get("speed"):
+            detail.append(f"{human(st['speed'])}/s")
+        if st.get("eta"):
+            detail.append(f"{short_time(st['eta'])} left")
+        if st.get("file"):
+            detail.append(st["file"])
+        return what + " - DO NOT UNPLUG", "on_yellow", "  ".join(detail)
+
+    # A finished device is unmounted, so "can be taken" must survive the
+    # volume disappearing - that banner is the whole point of the screen.
+    if phase == "done" and finished is not None \
+            and finished < READY_SHOW_MINUTES * 60:
+        detail = f"{st.get('files', 0)} files, {human(st.get('bytes', 0))}"
+        took = st.get("took")
+        if took and took > 1 and st.get("bytes"):
+            detail += (f" in {short_time(took)} "
+                       f"({human(st['bytes'] / took)}/s)")
+        return "DONE - CAN BE TAKEN", "on_green", detail
+
+    if docked:
+        if phase == "interrupted":
+            return "RESUMING", "on_yellow", "reconnected, picking up where it stopped"
+        if phase == "error":
+            return "ERROR", "on_red", st.get("error") or "see log"
+        if phase == "nothing_new":
+            return "NOTHING NEW - CAN BE TAKEN", "on_green", ""
+        return "CONNECTED", "cyan", "waiting"
+
+    # Not in the dock. A past failure is worth reporting to an engineer,
+    # but never as a banner: the device it refers to is not here, and a
+    # worker would read it as a warning about the one in their hand.
+    if phase == "interrupted":
+        return "not connected", "yellow", \
+            "copy interrupted - reconnect the device to resume"
+
+    if phase == "error" and finished is not None and finished < 24 * 3600:
+        return "not connected", "red", \
+            f"last attempt failed {ago(st.get('finished'))}: " \
+            f"{st.get('error') or 'see log'}"
+
+    last = st.get("last_done") or summary_last
+    idle = seconds_since(last)
+    if idle is not None and idle > STALE_HOURS * 3600:
+        return f"NO DATA FOR {idle / 3600:.0f} h", "red", "check the device"
+    return "not connected", "dim", f"last sync {ago(last)}"
+
+
+def render_dashboard(version, host, summary, pending, width):
+    lines = []
+    rule = paint("-" * min(width, 100), "dim")
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"{stamp}  {paint(host, 'cyan', 'bold')}  "
+                 f"wt901 {paint(version, 'dim')}")
+    lines.append(rule)
+
+    # Storage
+    space = free_space()
+    if space:
+        used = 1 - space["free"] / space["total"]
+        filled = int(used * 30)
+        colour = "red" if used > 0.9 else "yellow" if used > 0.75 else "green"
+        gauge = paint("#" * filled, colour) + paint("." * (30 - filled), "dim")
+        lines.append(f"{paint('STORAGE', 'blue', 'bold'):<20} {used * 100:3.0f}% "
+                     f"[{gauge}]  {human(space['free'])} free of "
+                     f"{human(space['total'])}")
+    lines.append("")
+
+    # Devices
+    docked = {}
+    for volume in find_volumes():
+        kind = device_kind(volume)
+        if kind:
+            docked[safe_name(volume.name)] = kind
+
+    by_name = {d["device"]: d for d in summary}
+    states = {}
+    if state_dir().is_dir():
+        for path in state_dir().glob("*.json"):
+            if path.stem not in SERVICE_STATES:
+                states[path.stem] = read_state(path.stem)
+
+    pending_by_dev = {}
+    for path in pending:
+        dev = path.parent.parent.name
+        pending_by_dev[dev] = pending_by_dev.get(dev, 0) + 1
+
+    names = sorted(set(by_name) | set(states) | set(docked))
+    banners = []
+    lines.append(paint("DEVICES", "blue", "bold"))
+    if not names:
+        lines.append(paint("  no devices seen yet", "dim"))
+
+    for name in names:
+        d = by_name.get(name, {})
+        st = states.get(name, {})
+        kind = docked.get(name) or st.get("kind") or d.get("kind") or "?"
+        label, colour, detail = device_status(
+            name, st, name in docked, d.get("last"))
+
+        if colour in ("on_yellow", "on_green", "on_red") \
+                and (name in docked or colour == "on_green"):
+            banners.append((name, label, colour))
+
+        upload = ""
+        if UPLOAD_REMOTE:
+            waiting = pending_by_dev.get(name, 0)
+            upload = (paint(f"cloud: {waiting} waiting", "yellow") if waiting
+                      else paint("cloud: up to date", "green"))
+
+        shown = paint(f" {label} ", colour) if colour.startswith("on_") \
+            else paint(label, colour)
+        # Green when the device is in the dock, grey when it is not.
+        # Red stays reserved for things that are actually wrong - a sensor
+        # being worn by a worker is its normal state, not a fault.
+        dot = paint("\u25cf", "green") if name in docked \
+            else paint("\u25cb", "dim")
+        lines.append(f"  {dot} {paint(name, 'bold'):<20} {kind:<9} {shown}  "
+                     f"{paint(detail, 'dim')}  {upload}")
+    lines.append("")
+
+    # Re-encoding
+    enc = read_state("transcoder")
+    if TRANSCODE or enc:
+        head = paint("PROCESSING", "blue", "bold")
+        phase = enc.get("phase")
+        waiting = enc.get("pending", 0)
+        if phase == "working" and (seconds_since(enc.get("updated")) or 0) < 600:
+            extra = ""
+            if enc.get("pace"):
+                extra += f"  {enc['pace']:.1f}x real time"
+            if enc.get("eta"):
+                extra += f"  {short_time(enc['eta'])} left"
+            state = paint(f"re-encoding {enc.get('file')}  "
+                          f"{enc.get('percent', 0)}%{extra}", "yellow", "bold")
+        elif phase == "error":
+            brief = " ".join((enc.get("error") or "").split())[:90]
+            state = paint(f"ERROR: {brief}", "red", "bold")
+        elif waiting:
+            state = paint(f"{waiting} videos waiting", "yellow")
+        else:
+            state = paint("idle, nothing to re-encode", "green")
+        lines.append(f"{head}  {state}")
+        saved = enc.get("saved", 0)
+        where = "GPU" if enc.get("encoder") == "gpu" else "CPU"
+        lines.append(f"  {TRANSCODE_HEIGHT}p on {where}   "
+                     f"waiting {waiting} ({human(enc.get('pending_bytes', 0))})"
+                     + (f"   space reclaimed {human(saved)}" if saved else ""))
+        lines.append("")
+
+    # Uploader
+    up = read_state("uploader")
+    head = paint("CLOUD UPLOAD", "blue", "bold")
+    if not UPLOAD_REMOTE:
+        lines.append(f"{head}  {paint('off (no --remote set)', 'dim')}")
+    else:
+        phase = up.get("phase")
+        waiting = len(pending)
+        wbytes = human(sum(dir_bytes(p) for p in pending))
+        if phase == "uploading" and (seconds_since(up.get("updated")) or 0) < 300:
+            extra = ""
+            if up.get("speed"):
+                extra += f"  {up['speed']}"
+            if up.get("eta"):
+                extra += f"  ETA {up['eta']}"
+            state = paint(f"uploading {up.get('session')}  "
+                          f"{up.get('percent', 0)}%{extra}", "yellow", "bold")
+        elif phase == "error":
+            state = paint(f"ERROR: {up.get('error')}", "red", "bold") + \
+                paint(f"  (retrying every {UPLOAD_INTERVAL:.0f} s)", "dim")
+        elif waiting:
+            state = paint(f"{waiting} sessions waiting", "yellow")
+        else:
+            state = paint("idle, nothing to upload", "green")
+        lines.append(f"{head}  {state}")
+        lines.append(f"  target {paint(UPLOAD_REMOTE, 'cyan')}   "
+                     f"waiting {waiting} ({wbytes})   "
+                     f"last success {ago(up.get('last_ok'))}")
+    lines.append("")
+
+    # Recent events
+    lines.append(paint("RECENT", "blue", "bold"))
+    for entry in tail_log(8):
+        entry = entry[:width - 2]
+        bad = any(word in entry.lower() for word in BAD_WORDS)
+        lines.append("  " + (paint(entry, "red") if bad else paint(entry, "dim")))
+
+    # Big banner for whoever is standing at the dock
+    top = []
+    order = {"on_red": 0, "on_yellow": 1, "on_green": 2}
+    for name, label, colour in sorted(banners, key=lambda b: order[b[2]]):
+        top.append(paint(f"   {name}:  {label}   ".ljust(min(width, 100)), colour))
+    if top:
+        top.append("")
+    return lines[:2] + top + lines[2:]
+
+
+def forget_device(name):
+    """Remove a device the dashboard should stop showing.
+
+    Cards renamed after their first use leave a row behind under the old
+    label. This clears the stale state, and the collected data with it
+    only if that data is empty.
+    """
+    removed = []
+    state_file = state_dir() / f"{safe_name(name)}.json"
+    if state_file.exists():
+        state_file.unlink()
+        removed.append(str(state_file))
+
+    folder = OUT_DIR / safe_name(name)
+    if folder.is_dir():
+        if dir_bytes(folder) == 0:
+            shutil.rmtree(folder, ignore_errors=True)
+            removed.append(str(folder))
+        else:
+            print(f"kept {folder} - it still holds "
+                  f"{human(dir_bytes(folder))} of data")
+
+    if removed:
+        print("removed:\n  " + "\n  ".join(removed))
+    else:
+        print(f"nothing to remove for {name!r}")
+    return 0
+
+
+def dashboard(refresh=1.0):
+    # The service knows where it uploads; reuse that so the dashboard
+    # works over SSH without repeating --remote every time.
+    if not UPLOAD_REMOTE and read_state("uploader").get("remote"):
+        globals()["UPLOAD_REMOTE"] = read_state("uploader")["remote"]
+    version, host = git_version(), socket.gethostname()
+    cache = {"at": 0.0, "summary": [], "pending": []}
+    sys.stdout.write("\033[2J\033[?25l")
+    try:
+        while True:
+            if time.time() - cache["at"] > 10:
+                cache["summary"] = device_summary()
+                cache["pending"] = pending_sessions() if UPLOAD_REMOTE else []
+                cache["pending_bytes"] = sum(dir_bytes(p) for p in cache["pending"])
+                cache["at"] = time.time()
+            width = shutil.get_terminal_size((100, 30)).columns
+            lines = render_dashboard(version, host, cache["summary"],
+                                     cache["pending"], width)
+            sys.stdout.write("\033[H" + "\n".join(l + "\033[K" for l in lines)
+                             + "\n\033[J")
+            sys.stdout.flush()
+            time.sleep(refresh)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
 # Auto-run on device connect
 # --------------------------------------------------------------------------
 
@@ -1603,6 +3084,11 @@ def install(delete_after):
         args = [str(python), str(script), "--once"]
         if delete_after:
             args.append("--delete")
+        if UPLOAD_REMOTE:
+            args += ["--remote", UPLOAD_REMOTE]
+        if TRANSCODE:
+            args += ["--transcode", "--height", str(TRANSCODE_HEIGHT),
+                     "--crf", str(TRANSCODE_CRF)]
         entries = "".join(f"\n        <string>{a}</string>" for a in args)
 
         plist = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -1645,18 +3131,74 @@ def install(delete_after):
         return 0
 
     if platform.system() == "Linux":
-        args = f"{python} {script} --once"
+        # A systemd *user* service that polls, rather than a udev rule.
+        # udev runs its hooks as root (wrong home dir, wrong /media path)
+        # and fires before the desktop session has mounted the volume, so
+        # a udev-triggered run usually finds nothing. Polling as the real
+        # user sees exactly the mounts the user sees.
+        args = f"{python} {script}"
         if delete_after:
             args += " --delete"
-        rule = (
-            'ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", '
-            f'RUN+="/usr/bin/systemd-run --no-block {args}"\n'
-        )
-        print("\nThe udev rule must be installed as root.")
-        print("Run these two commands:\n")
-        print(f"  echo '{rule.strip()}' | "
-              "sudo tee /etc/udev/rules.d/99-wt901.rules")
-        print("  sudo udevadm control --reload-rules\n")
+        if UPLOAD_REMOTE:
+            args += f" --remote {UPLOAD_REMOTE}"
+        if TRANSCODE:
+            args += (f" --transcode --height {TRANSCODE_HEIGHT}"
+                     f" --crf {TRANSCODE_CRF}")
+            if TRANSCODE_KEEP_ORIGINAL:
+                args += " --keep-original"
+        unit_dir = Path.home() / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        unit = unit_dir / "wt901.service"
+        unit.write_text(f"""[Unit]
+Description=WT901 bracelet and camera collector
+
+[Service]
+ExecStart={args}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+""")
+        steps = [
+            ["systemctl", "--user", "daemon-reload"],
+            ["systemctl", "--user", "enable", "--now", "wt901.service"],
+        ]
+        for cmd in steps:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"{' '.join(cmd)} failed: {result.stderr.strip()}")
+                return 1
+
+        # Dashboard on the dock's own screen, for whoever takes the devices
+        autostart = Path.home() / ".config" / "autostart"
+        autostart.mkdir(parents=True, exist_ok=True)
+        remote_arg = f" --remote {UPLOAD_REMOTE}" if UPLOAD_REMOTE else ""
+        if TRANSCODE:
+            remote_arg += " --transcode"
+        (autostart / "wt901-dashboard.desktop").write_text(f"""[Desktop Entry]
+Type=Application
+Name=WT901 dashboard
+Exec=gnome-terminal --full-screen -- {python} {script} --dashboard{remote_arg}
+X-GNOME-Autostart-enabled=true
+""")
+
+        print(f"\nservice installed: {unit}")
+        print("dashboard will open full-screen after login")
+        print("it polls for devices every "
+              f"{POLL_INTERVAL:.0f} s and restarts itself if it crashes")
+        print("\ncheck it:   systemctl --user status wt901")
+        print("live log:   journalctl --user -u wt901 -f")
+        print(f"remove:     python3 {script} --uninstall")
+        print("\nFor an unattended dock two more things are needed:")
+        print("  1. keep the service running with nobody logged in:")
+        print(f"       sudo loginctl enable-linger {Path.home().name}")
+        print("  2. turn on automatic login (Settings > Users), because")
+        print("     USB volumes are only auto-mounted inside a desktop session")
+        print("  3. keep the screen awake for the dashboard:")
+        bus = "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus"
+        print(f"       {bus} gsettings set org.gnome.desktop.session idle-delay 0")
+        print(f"       {bus} gsettings set org.gnome.desktop.screensaver lock-enabled false\n")
         return 0
 
     print(f"auto-run is not supported on {platform.system()}")
@@ -1676,9 +3218,16 @@ def uninstall():
         return 0
 
     if platform.system() == "Linux":
-        print("\nRun:\n")
-        print("  sudo rm /etc/udev/rules.d/99-wt901.rules")
-        print("  sudo udevadm control --reload-rules\n")
+        unit = Path.home() / ".config" / "systemd" / "user" / "wt901.service"
+        subprocess.run(["systemctl", "--user", "disable", "--now", "wt901.service"],
+                       capture_output=True)
+        if unit.exists():
+            unit.unlink()
+        kiosk = Path.home() / ".config" / "autostart" / "wt901-dashboard.desktop"
+        if kiosk.exists():
+            kiosk.unlink()
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print("service removed")
         return 0
 
     return 1
@@ -1703,6 +3252,28 @@ def main():
                         help="remove the auto-run agent")
     parser.add_argument("--volume", metavar="NAME",
                         help="only use volumes whose name contains this")
+    parser.add_argument("--label", metavar="NAME",
+                        help="name the card that is plugged in, e.g. CAM02")
+    parser.add_argument("--forget", metavar="DEVICE",
+                        help="stop showing a device that will not come back")
+    parser.add_argument("--benchmark", metavar="VIDEO",
+                        help="time encoder settings on one of your own files")
+    parser.add_argument("--seconds", type=int, default=60, metavar="N",
+                        help="length of the sample for --benchmark")
+    parser.add_argument("--transcode", action="store_true",
+                        help="re-encode video to a much smaller file")
+    parser.add_argument("--height", type=int, metavar="PIXELS",
+                        help="output height for --transcode (default 720)")
+    parser.add_argument("--crf", type=int, metavar="N",
+                        help="quality for --transcode, lower is better (default 28)")
+    parser.add_argument("--keep-original", action="store_true",
+                        help="keep the camera original beside the small copy")
+    parser.add_argument("--dashboard", action="store_true",
+                        help="full-screen live dashboard")
+    parser.add_argument("--upload", action="store_true",
+                        help="upload finished sessions once, then exit")
+    parser.add_argument("--remote", metavar="REMOTE",
+                        help="rclone remote for uploads, e.g. cloud:farm-data")
     parser.add_argument("--status", action="store_true",
                         help="overview of all sensors and collected data")
     parser.add_argument("--json", action="store_true",
@@ -1732,6 +3303,18 @@ def main():
     if args.keep_raw:
         globals()["KEEP_RAW"] = True
 
+    if args.remote:
+        globals()["UPLOAD_REMOTE"] = args.remote
+
+    if args.transcode:
+        globals()["TRANSCODE"] = True
+    if args.height:
+        globals()["TRANSCODE_HEIGHT"] = args.height
+    if args.crf:
+        globals()["TRANSCODE_CRF"] = args.crf
+    if args.keep_original:
+        globals()["TRANSCODE_KEEP_ORIGINAL"] = True
+
     if args.rate:
         codes = {20: (0x07, 0x05), 50: (0x08, 0x04),
                  100: (0x09, 0x03), 200: (0x0B, 0x02)}
@@ -1747,6 +3330,24 @@ def main():
                     else "verify" if args.verify
                     else "listen" if args.listen else "apply")
             sys.exit(asyncio.run(ble_main(mode)))
+        elif args.label:
+            sys.exit(label_device(args.label, args.volume))
+        elif args.benchmark:
+            sys.exit(benchmark(args.benchmark, args.seconds,
+                               [args.height] if args.height else None))
+        elif args.forget:
+            sys.exit(forget_device(args.forget))
+        elif args.dashboard:
+            dashboard()
+        elif args.upload:
+            if not UPLOAD_REMOTE:
+                print("set a target with --remote, e.g. --remote cloud:farm-data")
+                sys.exit(1)
+            globals()["QUIET"] = False
+            upload_pass()
+            up = read_state("uploader")
+            print(f"uploader: {up.get('phase')}  "
+                  f"waiting {up.get('pending', 0)}  error {up.get('error')}")
         elif args.status:
             show_status(args.json)
         elif args.list:

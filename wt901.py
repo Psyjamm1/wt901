@@ -543,9 +543,12 @@ def mount_new_media(skip_uuids):
         name = device["label"] or device["path"]
         if result.returncode == 0:
             log(f"mounted {name}")
-        else:
-            message = (result.stderr or result.stdout).strip().splitlines()
-            log(f"could not mount {name}: {message[-1] if message else '?'}")
+            continue
+        message = (result.stderr or result.stdout).strip()
+        if "AlreadyMounted" in message:
+            continue          # someone got there first; nothing to report
+        last = message.splitlines()
+        log(f"could not mount {name}: {last[-1] if last else '?'}")
 
 
 def volume_uuid(volume):
@@ -1614,7 +1617,18 @@ _VAAPI_BROKEN = False
 def vaapi_available():
     if TRANSCODE_HW == "none" or _VAAPI_BROKEN:
         return False
-    if not Path("/dev/dri/renderD128").exists():
+
+    node = Path("/dev/dri/renderD128")
+    if not node.exists():
+        log("no GPU render node; encoding on the CPU")
+        return False
+    # The node belongs to the "render" group. A process started before its
+    # user was added to that group still cannot open it, which is easy to
+    # miss when the only symptom is slow encoding.
+    if not os.access(node, os.R_OK | os.W_OK):
+        log(f"no access to {node} - add the user to the 'render' group "
+            f"and restart the machine; encoding on the CPU meanwhile")
+        globals()["_VAAPI_BROKEN"] = True
         return False
     try:
         result = subprocess.run([ffmpeg_bin(), "-hide_banner", "-encoders"],

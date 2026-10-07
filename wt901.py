@@ -686,11 +686,14 @@ def label_device(new_name, pick=None):
         print((result.stderr or result.stdout).strip()[:300])
         return 1
 
-    # Reading it back is the only proof the label really took
+    # Reading it back is the only proof the label really took.
+    # exfatlabel answers "label: CAM02", fatlabel just "CAM02".
     check = subprocess.run(["sudo", tool, device["path"]],
                            capture_output=True, text=True)
     written = (check.stdout or "").strip().splitlines()
     got = written[-1].strip() if written else ""
+    if ":" in got:
+        got = got.split(":", 1)[1].strip()
     subprocess.run(["udisksctl", "mount", "-b", device["path"],
                     "--no-user-interaction"], capture_output=True)
 

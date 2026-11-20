@@ -13,6 +13,13 @@ DATA COLLECTION (pure stdlib, runs on the system Python)
     python3 wt901.py --install --delete    auto-run on device connect
     python3 wt901.py --uninstall           remove the auto-run agent
 
+LOADER EVENTS (UWB tags on the feed loaders, pure stdlib)
+    python3 wt901.py --feed-port 8080 --feed-token KEY
+                                           collector + receiver for loaders
+    python3 wt901.py --feed-only --feed-port 8080 --feed-token KEY
+                                           receiver only, no USB collection
+    python3 wt901.py --feed-csv 2026-11-19 events for one day as CSV
+
 SENSOR CONFIGURATION (requires: pip install bleak)
     python3 wt901.py --scan                find the sensor over BLE
     python3 wt901.py --verify              show current settings
@@ -41,12 +48,15 @@ import os
 import platform
 import re
 import socket
+import sqlite3
 import shutil
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
 # ==========================================================================
@@ -125,6 +135,16 @@ IGNORED_NAMES = {
     "com.apple.TimeMachine.localsnapshots", "home", "net",
 }
 
+# --- Feed loaders (UWB tags) ---
+# The tag on each loader keeps its events on a microSD card and posts them
+# here over Wi-Fi when the loader is parked. 0 turns the receiver off.
+FEED_PORT = 0
+# Shared key the tags send as "Authorization: Bearer <key>". Empty means
+# no check. Can also come from the WT901_FEED_TOKEN environment variable,
+# which keeps it out of the process list.
+FEED_TOKEN = ""
+FEED_MAX_BODY = 1_000_000  # bytes per request; a tag sends in batches
+
 AGENT_LABEL = "com.wt901.collector"
 
 # ==========================================================================
@@ -187,7 +207,7 @@ def save_state(seen):
 # --------------------------------------------------------------------------
 
 # State files that describe background jobs, not physical devices
-SERVICE_STATES = {"uploader", "transcoder"}
+SERVICE_STATES = {"uploader", "transcoder", "feed"}
 
 
 def state_dir():
@@ -1956,6 +1976,258 @@ def uploader_loop():
         time.sleep(UPLOAD_INTERVAL)
 
 
+# --------------------------------------------------------------------------
+# Feed loaders: receiving events from the UWB tags
+#
+# Each tag numbers its events with a running sequence number. The server
+# stores them keyed on (device, seq) and answers with the highest number it
+# holds; the tag marks everything up to that as delivered. A batch sent
+# twice after a dropped connection is therefore harmless.
+# --------------------------------------------------------------------------
+
+FEED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS feed_events (
+    device_id    TEXT    NOT NULL,
+    seq          INTEGER NOT NULL,
+    farm_id      TEXT,
+    bunk         INTEGER,
+    anchor       INTEGER,
+    start_ts     TEXT    NOT NULL,
+    end_ts       TEXT    NOT NULL,
+    duration_s   INTEGER,
+    min_range_cm INTEGER,
+    firmware     TEXT,
+    received_at  TEXT    NOT NULL,
+    PRIMARY KEY (device_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_feed_start ON feed_events(start_ts);
+"""
+
+_feed_lock = threading.Lock()
+
+
+def feed_db_path():
+    return OUT_DIR / "loaders" / "feed.db"
+
+
+def feed_connect():
+    path = feed_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=10, check_same_thread=False)
+    conn.executescript(FEED_SCHEMA)
+    return conn
+
+
+def feed_store(payload):
+    """Save one batch from a tag. Returns (ack_seq, inserted)."""
+    device = safe_name(str(payload["device_id"]))
+    events = payload.get("events") or []
+    if not isinstance(events, list):
+        raise ValueError("events must be a list")
+    farm, firmware = payload.get("farm_id"), payload.get("firmware")
+    received = now_iso()
+
+    rows = []
+    for ev in events:
+        rows.append((device, int(ev["seq"]), farm,
+                     ev.get("bunk"), ev.get("anchor"),
+                     str(ev["start"]), str(ev["end"]),
+                     ev.get("duration_s"), ev.get("min_range_cm"),
+                     firmware, received))
+
+    with _feed_lock:
+        conn = feed_connect()
+        try:
+            before = conn.total_changes
+            conn.executemany(
+                "INSERT OR IGNORE INTO feed_events VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                rows)
+            conn.commit()
+            inserted = conn.total_changes - before
+            row = conn.execute("SELECT MAX(seq) FROM feed_events "
+                               "WHERE device_id=?", (device,)).fetchone()
+        finally:
+            conn.close()
+
+    # A plain-text copy beside the database: readable without tools and
+    # picked up by nothing else, so the uploader and dashboard are unaffected.
+    if inserted:
+        day_dir = OUT_DIR / "loaders" / device
+        try:
+            day_dir.mkdir(parents=True, exist_ok=True)
+            for r in rows:
+                day = r[5][:10]
+                with open(day_dir / f"{day}.jsonl", "a") as handle:
+                    handle.write(json.dumps({
+                        "seq": r[1], "bunk": r[3], "anchor": r[4],
+                        "start": r[5], "end": r[6], "duration_s": r[7],
+                        "min_range_cm": r[8]}, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            log(f"loader {device}: could not write jsonl copy: {exc}")
+
+    ack = row[0] if row and row[0] is not None else -1
+    return device, ack, inserted
+
+
+def feed_rows(day=None, device=None):
+    sql = ("SELECT device_id, seq, farm_id, bunk, anchor, start_ts, end_ts, "
+           "duration_s, min_range_cm FROM feed_events WHERE 1=1")
+    args = []
+    if day:
+        sql += " AND substr(start_ts,1,10)=?"
+        args.append(day)
+    if device:
+        sql += " AND device_id=?"
+        args.append(device)
+    sql += " ORDER BY start_ts"
+    if not feed_db_path().exists():
+        return []
+    with _feed_lock:
+        conn = feed_connect()
+        try:
+            return conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+
+
+def feed_csv(day=None, device=None):
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["device_id", "seq", "farm_id", "bunk", "anchor",
+                     "start", "end", "duration_s", "min_range_cm"])
+    writer.writerows(feed_rows(day, device))
+    return buf.getvalue()
+
+
+def feed_summary():
+    """Per loader: last sync, events today, last bunk visited."""
+    if not feed_db_path().exists():
+        return []
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _feed_lock:
+        conn = feed_connect()
+        try:
+            rows = conn.execute("""
+                SELECT device_id,
+                       MAX(received_at),
+                       SUM(CASE WHEN substr(start_ts,1,10)=? THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN substr(start_ts,1,10)=? THEN duration_s ELSE 0 END),
+                       (SELECT bunk FROM feed_events f2
+                         WHERE f2.device_id=f.device_id
+                         ORDER BY start_ts DESC LIMIT 1)
+                FROM feed_events f GROUP BY device_id ORDER BY device_id
+            """, (today, today)).fetchall()
+        finally:
+            conn.close()
+    return [{"device": r[0], "last_sync": r[1], "today": r[2] or 0,
+             "today_s": r[3] or 0, "last_bunk": r[4]} for r in rows]
+
+
+class FeedHandler(BaseHTTPRequestHandler):
+    server_version = "wt901-feed"
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj, ensure_ascii=False))
+
+    def _authorized(self):
+        return not FEED_TOKEN or \
+            self.headers.get("Authorization", "") == f"Bearer {FEED_TOKEN}"
+
+    def log_message(self, fmt, *args):
+        pass                      # the useful lines go through log()
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/api/feed-events":
+            return self._json(404, {"error": "not found"})
+        if not self._authorized():
+            log(f"loader post from {self.client_address[0]} rejected: bad key")
+            return self._json(401, {"error": "unauthorized"})
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > FEED_MAX_BODY:
+            return self._json(400, {"error": "bad length"})
+        try:
+            payload = json.loads(self.rfile.read(length))
+            device, ack, inserted = feed_store(payload)
+        except (ValueError, KeyError, TypeError) as exc:
+            log(f"loader post from {self.client_address[0]} failed: {exc}")
+            return self._json(400, {"error": str(exc)[:200]})
+        except sqlite3.Error as exc:
+            log(f"loader database error: {exc}")
+            return self._json(500, {"error": "database"})
+
+        count = len(payload.get("events") or [])
+        log(f"loader {device}: {count} events, {inserted} new, ack {ack}")
+        write_state("feed", phase="listening", last_post=now_iso(),
+                    last_device=device, port=FEED_PORT, error=None)
+        return self._json(200, {"ack_seq": ack, "inserted": inserted})
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        query = parse_qs(url.query)
+        if url.path == "/api/health":
+            return self._json(200, {"ok": True})
+        if url.path == "/api/events.csv":
+            # Reading is open on the farm network; only writing needs the key.
+            return self._send(200, feed_csv(query.get("date", [None])[0],
+                                            query.get("device", [None])[0]),
+                              "text/csv; charset=utf-8")
+        if url.path == "/":
+            import html
+            rows = feed_rows(query.get("date", [None])[0])[-300:][::-1]
+            body = "".join(
+                f"<tr><td>{html.escape(str(r[0]))}</td><td>{r[3]}</td>"
+                f"<td>{html.escape(r[5])}</td><td>{html.escape(r[6])}</td>"
+                f"<td>{r[7] if r[7] is not None else ''}</td></tr>" for r in rows)
+            page = ("<!doctype html><meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width'>"
+                    "<title>Loaders</title><style>body{font-family:sans-serif;"
+                    "margin:16px}table{border-collapse:collapse}td,th{border:1px "
+                    "solid #ccc;padding:4px 8px}</style><h2>Loader events</h2>"
+                    "<p><a href='/api/events.csv'>CSV</a></p><table><tr>"
+                    "<th>Loader</th><th>Bunk</th><th>In</th><th>Out</th>"
+                    "<th>Sec</th></tr>" + body + "</table>")
+            return self._send(200, page, "text/html; charset=utf-8")
+        return self._json(404, {"error": "not found"})
+
+
+def start_feed_server():
+    """Run the receiver in a background thread. False if the port is busy."""
+    try:
+        feed_connect().close()
+        server = ThreadingHTTPServer(("0.0.0.0", FEED_PORT), FeedHandler)
+    except (OSError, sqlite3.Error) as exc:
+        log(f"loader receiver could not start on port {FEED_PORT}: {exc}")
+        write_state("feed", phase="error", port=FEED_PORT, error=str(exc)[:200])
+        return False
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log(f"loader receiver listening on port {FEED_PORT}, "
+        f"key {'on' if FEED_TOKEN else 'OFF'}, data in {feed_db_path()}")
+    write_state("feed", phase="listening", port=FEED_PORT, error=None)
+    return True
+
+
+def feed_only():
+    """Receiver without USB collection, for a machine that is not a dock."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not start_feed_server():
+        return 1
+    while True:
+        time.sleep(3600)
+
+
 def run_once(delete_after):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     clear_stuck_state()
@@ -2107,6 +2379,8 @@ def watch(delete_after):
     if TRANSCODE:
         log(f"re-encoding video to {TRANSCODE_HEIGHT}p in the background")
         threading.Thread(target=transcoder_loop, daemon=True).start()
+    if FEED_PORT:
+        start_feed_server()
     clear_stuck_state()
 
     done = set()        # finished while this volume stayed mounted
@@ -3028,6 +3302,30 @@ def render_dashboard(version, host, summary, pending, width):
                      f"last success {ago(up.get('last_ok'))}")
     lines.append("")
 
+    # Feed loaders
+    feed = read_state("feed")
+    loaders = feed_summary()
+    if feed or loaders:
+        head = paint("LOADERS", "blue", "bold")
+        if feed.get("phase") == "error":
+            state = paint(f"ERROR: {feed.get('error')}", "red", "bold")
+        elif feed.get("phase") == "listening":
+            state = paint(f"receiver on port {feed.get('port')}", "green")
+        else:
+            state = paint("receiver off", "dim")
+        lines.append(f"{head}  {state}")
+        for d in loaders:
+            idle = seconds_since(d["last_sync"])
+            if idle is not None and idle > STALE_HOURS * 3600:
+                sync = paint(f"NO SYNC FOR {idle / 3600:.0f} h", "red", "bold")
+            else:
+                sync = paint(f"last sync {ago(d['last_sync'])}", "dim")
+            lines.append(f"  {paint(d['device'], 'bold'):<20} "
+                         f"today {d['today']} visits, "
+                         f"{short_time(d['today_s']) or '0 s'}   "
+                         f"last bunk {d['last_bunk']}   {sync}")
+        lines.append("")
+
     # Recent events
     lines.append(paint("RECENT", "blue", "bold"))
     for entry in tail_log(8):
@@ -3174,6 +3472,10 @@ def install(delete_after):
         args = f"{python} {script}"
         if delete_after:
             args += " --delete"
+        if FEED_PORT:
+            # The key is not written into the unit: it would show up in
+            # "ps". It goes into an environment file only the user can read.
+            args += f" --feed-port {FEED_PORT}"
         if UPLOAD_REMOTE:
             args += f" --remote {UPLOAD_REMOTE}"
         if TRANSCODE:
@@ -3184,10 +3486,17 @@ def install(delete_after):
         unit_dir = Path.home() / ".config" / "systemd" / "user"
         unit_dir.mkdir(parents=True, exist_ok=True)
         unit = unit_dir / "wt901.service"
+        if FEED_TOKEN:
+            env_dir = Path.home() / ".config" / "wt901"
+            env_dir.mkdir(parents=True, exist_ok=True)
+            env_file = env_dir / "feed.env"
+            env_file.write_text(f"WT901_FEED_TOKEN={FEED_TOKEN}\n")
+            env_file.chmod(0o600)
         unit.write_text(f"""[Unit]
 Description=WT901 bracelet and camera collector
 
 [Service]
+EnvironmentFile=-%h/.config/wt901/feed.env
 ExecStart={args}
 Restart=always
 RestartSec=10
@@ -3326,6 +3635,16 @@ def main():
     parser.add_argument("--keep-raw", action="store_true",
                         help="keep the raw .TXT files after decoding")
 
+    feed = parser.add_argument_group("feed loaders (UWB tags)")
+    feed.add_argument("--feed-port", type=int, metavar="PORT",
+                      help="accept loader events on this port, e.g. 8080")
+    feed.add_argument("--feed-token", metavar="KEY",
+                      help="key the tags must send (or WT901_FEED_TOKEN)")
+    feed.add_argument("--feed-only", action="store_true",
+                      help="run only the loader receiver, no USB collection")
+    feed.add_argument("--feed-csv", nargs="?", const="", metavar="DATE",
+                      help="print loader events as CSV, optionally one day")
+
     ble = parser.add_argument_group("sensor configuration over Bluetooth")
     ble.add_argument("--scan", action="store_true",
                      help="find the sensor over BLE")
@@ -3351,6 +3670,12 @@ def main():
     if args.remote:
         globals()["UPLOAD_REMOTE"] = args.remote
 
+    if args.feed_port:
+        globals()["FEED_PORT"] = args.feed_port
+    token = args.feed_token or os.environ.get("WT901_FEED_TOKEN", "")
+    if token:
+        globals()["FEED_TOKEN"] = token
+
     if args.transcode:
         globals()["TRANSCODE"] = True
     if args.height:
@@ -3375,6 +3700,14 @@ def main():
                     else "verify" if args.verify
                     else "listen" if args.listen else "apply")
             sys.exit(asyncio.run(ble_main(mode)))
+        elif args.feed_csv is not None:
+            sys.stdout.write(feed_csv(args.feed_csv or None))
+        elif args.feed_only:
+            if not FEED_PORT:
+                print("set a port with --feed-port, e.g. --feed-port 8080")
+                sys.exit(1)
+            globals()["QUIET"] = False
+            sys.exit(feed_only())
         elif args.label:
             sys.exit(label_device(args.label, args.volume))
         elif args.benchmark:
